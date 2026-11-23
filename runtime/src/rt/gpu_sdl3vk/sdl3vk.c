@@ -1368,8 +1368,8 @@ static int collect_game_tids(int32_t *out, int max_out) {
         snprintf(path, sizeof(path), "/proc/self/task/%d/comm", (int)tid);
         FILE *f = fopen(path, "r");
         if (f) { fgets(comm, sizeof(comm), f); fclose(f); }
-        /* Keep audio/binder threads on system scheduler; boost all game/render/worker threads */
-        if (strstr(comm, "Audio") || strstr(comm, "AAudio") || strstr(comm, "Binder")) continue;
+        /* Keep audio/binder/video-decode threads on system scheduler; boost all game/render/worker threads */
+        if (strstr(comm, "Audio") || strstr(comm, "AAudio") || strstr(comm, "Binder") || strstr(comm, "H264Dec")) continue;
         out[n++] = (int32_t)tid;
     }
     closedir(d);

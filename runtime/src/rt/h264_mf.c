@@ -24,6 +24,8 @@
 #elif defined(__ANDROID__)
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaFormat.h>
+#include <pthread.h>
+#include <time.h>
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #endif
@@ -57,6 +59,16 @@ static const GUID L_MF_LOW_LATENCY      = {0x9c27891a,0xed7a,0x40e1,{0x88,0xe8,0
 #endif
 #endif /* _WIN32 */
 
+#ifdef __ANDROID__
+#define MC_OUT_SLOTS 6
+typedef struct {
+    uint8_t *yuv;
+    uint32_t cap;
+    uint32_t len;
+    int w, h, stride, sliceH, colorFmt;
+} MCOutSlot;
+#endif
+
 typedef struct {
     int used;
 #ifdef _WIN32
@@ -69,6 +81,18 @@ typedef struct {
     int sliceH;
     uint8_t *lastFrame;
     uint32_t lastFrameBytes;
+    pthread_t th;
+    int thStarted;
+    pthread_mutex_t mu;
+    pthread_cond_t cond_in;
+    pthread_cond_t cond_out;
+    int stop;
+    int eos;
+    int outEos;
+    int firstOut;
+    int inFlight;
+    MCOutSlot slots[MC_OUT_SLOTS];
+    int qHead, qTail, qCount;
 #endif
     int outW, outH, outStride;
     int failed;
@@ -376,13 +400,14 @@ static uint32_t next_aud(Dec *d, uint32_t from) {
 }
 static uint8_t clamp8(int v) { return v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v; }
 
-static void convert_frame_android(Dec *d, const uint8_t *src, uint32_t srcLen,
-                                  uint8_t *dst, int frameWidth, int pixelMode) {
-    int stride = d->outStride > 0 ? d->outStride : d->outW;
-    int sh = d->sliceH > 0 ? d->sliceH : d->outH;
-    int w = d->outW, h = d->outH;
-    if (w <= 0 || h <= 0) return;
-    int planar = (d->colorFmt == 19); /* COLOR_FormatYUV420Planar */
+static void convert_frame_android(const MCOutSlot *s, uint8_t *dst, int frameWidth, int pixelMode) {
+    const uint8_t *src = s->yuv;
+    uint32_t srcLen = s->len;
+    int stride = s->stride > 0 ? s->stride : s->w;
+    int sh = s->sliceH > 0 ? s->sliceH : s->h;
+    int w = s->w, h = s->h;
+    if (!src || w <= 0 || h <= 0) return;
+    int planar = (s->colorFmt == 19); /* COLOR_FormatYUV420Planar */
     size_t y_sz = (size_t)stride * sh;
     if (y_sz + y_sz / 2 > srcLen) return;
     if (w > frameWidth) w = frameWidth;
@@ -494,6 +519,130 @@ static void convert_frame_android(Dec *d, const uint8_t *src, uint32_t srcLen,
     }
 }
 
+static void *mc_worker(void *arg) {
+    Dec *d = (Dec *)arg;
+    pthread_setname_np(pthread_self(), "H264Dec");
+    uint8_t *auBuf = NULL;
+    uint32_t auCap = 0, auLen = 0;
+
+    for (;;) {
+        pthread_mutex_lock(&d->mu);
+        while (!d->stop && !d->failed) {
+            int can_pop_au = (auLen == 0 && d->esCur < d->esLen);
+            if (can_pop_au) {
+                uint32_t end = next_aud(d, d->esCur + 4);
+                if (end >= d->esLen && !d->eos) can_pop_au = 0;
+            }
+            int can_send_eos = (auLen == 0 && d->esCur >= d->esLen && d->eos && !d->drained);
+            int can_drain_out = (d->qCount < MC_OUT_SLOTS && (d->inFlight > 0 || d->drained) && !d->outEos);
+            if (auLen > 0 || can_pop_au || can_send_eos || can_drain_out) break;
+            pthread_cond_wait(&d->cond_in, &d->mu);
+        }
+        if (d->stop || d->failed) {
+            pthread_mutex_unlock(&d->mu);
+            break;
+        }
+        if (auLen == 0 && d->esCur < d->esLen) {
+            uint32_t end = next_aud(d, d->esCur + 4);
+            if (end < d->esLen || d->eos) {
+                uint32_t len = end - d->esCur;
+                if (len > 0 && buf_reserve(&auBuf, &auCap, len)) {
+                    memcpy(auBuf, d->es + d->esCur, len);
+                    auLen = len;
+                }
+                d->esCur = end;
+                es_compact(d);
+            }
+        }
+        int want_eos = (auLen == 0 && d->esCur >= d->esLen && d->eos && !d->drained);
+        int q_full = (d->qCount >= MC_OUT_SLOTS);
+        int in_flight = d->inFlight;
+        int drained = d->drained;
+        int out_eos = d->outEos;
+        pthread_mutex_unlock(&d->mu);
+
+        if (auLen > 0) {
+            ssize_t inIdx = AMediaCodec_dequeueInputBuffer(d->mc, 1000);
+            if (inIdx >= 0) {
+                size_t isz = 0;
+                uint8_t *ibuf = AMediaCodec_getInputBuffer(d->mc, (size_t)inIdx, &isz);
+                if (ibuf && auLen <= isz) {
+                    memcpy(ibuf, auBuf, auLen);
+                    AMediaCodec_queueInputBuffer(d->mc, (size_t)inIdx, 0, auLen, (uint64_t)d->nextTimeUs, 0);
+                    d->nextTimeUs += 33367;
+                    pthread_mutex_lock(&d->mu);
+                    d->inFlight++;
+                    pthread_mutex_unlock(&d->mu);
+                } else {
+                    AMediaCodec_queueInputBuffer(d->mc, (size_t)inIdx, 0, 0, 0, 0);
+                }
+                auLen = 0;
+            }
+        } else if (want_eos) {
+            ssize_t inIdx = AMediaCodec_dequeueInputBuffer(d->mc, 1000);
+            if (inIdx >= 0) {
+                AMediaCodec_queueInputBuffer(d->mc, (size_t)inIdx, 0, 0, 0, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
+                pthread_mutex_lock(&d->mu);
+                d->drained = 1;
+                pthread_mutex_unlock(&d->mu);
+            }
+        }
+
+        if (!q_full && (in_flight > 0 || drained || auLen > 0) && !out_eos) {
+            AMediaCodecBufferInfo info;
+            int64_t wait_us = (auLen > 0 || want_eos) ? 1000 : 4000;
+            ssize_t outIdx = AMediaCodec_dequeueOutputBuffer(d->mc, &info, wait_us);
+            if (outIdx == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+                AMediaFormat *of = AMediaCodec_getOutputFormat(d->mc);
+                if (of) {
+                    int32_t v = 0;
+                    if (AMediaFormat_getInt32(of, AMEDIAFORMAT_KEY_WIDTH, &v) && v > 0) d->outW = v;
+                    if (AMediaFormat_getInt32(of, AMEDIAFORMAT_KEY_HEIGHT, &v) && v > 0) d->outH = v;
+                    if (AMediaFormat_getInt32(of, AMEDIAFORMAT_KEY_STRIDE, &v) && v > 0) d->outStride = v;
+                    else d->outStride = d->outW;
+                    if (AMediaFormat_getInt32(of, "slice-height", &v) && v > 0) d->sliceH = v;
+                    else d->sliceH = d->outH;
+                    if (AMediaFormat_getInt32(of, AMEDIAFORMAT_KEY_COLOR_FORMAT, &v)) d->colorFmt = v;
+                    AMediaFormat_delete(of);
+                }
+            } else if (outIdx >= 0) {
+                size_t osz = 0;
+                uint8_t *obuf = AMediaCodec_getOutputBuffer(d->mc, (size_t)outIdx, &osz);
+                if (obuf && info.size > 0) {
+                    pthread_mutex_lock(&d->mu);
+                    if (d->qCount < MC_OUT_SLOTS) {
+                        MCOutSlot *s = &d->slots[d->qTail];
+                        if (buf_reserve(&s->yuv, &s->cap, (uint32_t)info.size)) {
+                            memcpy(s->yuv, obuf + info.offset, (size_t)info.size);
+                            s->len = (uint32_t)info.size;
+                            s->w = d->outW;
+                            s->h = d->outH;
+                            s->stride = d->outStride;
+                            s->sliceH = d->sliceH;
+                            s->colorFmt = d->colorFmt;
+                            d->qTail = (d->qTail + 1) % MC_OUT_SLOTS;
+                            d->qCount++;
+                        }
+                    }
+                    if (d->inFlight > 0) d->inFlight--;
+                    if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) d->outEos = 1;
+                    pthread_cond_signal(&d->cond_out);
+                    pthread_mutex_unlock(&d->mu);
+                } else {
+                    pthread_mutex_lock(&d->mu);
+                    if (d->inFlight > 0) d->inFlight--;
+                    if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) d->outEos = 1;
+                    pthread_cond_signal(&d->cond_out);
+                    pthread_mutex_unlock(&d->mu);
+                }
+                AMediaCodec_releaseOutputBuffer(d->mc, (size_t)outIdx, false);
+            }
+        }
+    }
+    free(auBuf);
+    return NULL;
+}
+
 static int mc_open(Dec *d) {
     d->mc = AMediaCodec_createDecoderByType("video/avc");
     if (!d->mc) return 0;
@@ -508,6 +657,23 @@ static int mc_open(Dec *d) {
     if (st != AMEDIA_OK) { AMediaCodec_delete(d->mc); d->mc = NULL; return 0; }
     if (AMediaCodec_start(d->mc) != AMEDIA_OK) { AMediaCodec_delete(d->mc); d->mc = NULL; return 0; }
     d->outW = 480; d->outH = 272; d->outStride = 480; d->sliceH = 272; d->colorFmt = 21;
+    pthread_mutex_init(&d->mu, NULL);
+    pthread_condattr_t cattr;
+    pthread_condattr_init(&cattr);
+    pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
+    pthread_cond_init(&d->cond_in, &cattr);
+    pthread_cond_init(&d->cond_out, &cattr);
+    pthread_condattr_destroy(&cattr);
+    if (pthread_create(&d->th, NULL, mc_worker, d) != 0) {
+        pthread_cond_destroy(&d->cond_in);
+        pthread_cond_destroy(&d->cond_out);
+        pthread_mutex_destroy(&d->mu);
+        AMediaCodec_stop(d->mc);
+        AMediaCodec_delete(d->mc);
+        d->mc = NULL;
+        return 0;
+    }
+    d->thStarted = 1;
     return 1;
 }
 #endif
@@ -541,6 +707,19 @@ void sr_h264_destroy(int id) {
 #ifdef _WIN32
     if (d->xf) IMFTransform_Release(d->xf);
 #elif defined(__ANDROID__)
+    if (d->thStarted) {
+        pthread_mutex_lock(&d->mu);
+        d->stop = 1;
+        pthread_cond_broadcast(&d->cond_in);
+        pthread_cond_broadcast(&d->cond_out);
+        pthread_mutex_unlock(&d->mu);
+        pthread_join(d->th, NULL);
+        pthread_cond_destroy(&d->cond_in);
+        pthread_cond_destroy(&d->cond_out);
+        pthread_mutex_destroy(&d->mu);
+        d->thStarted = 0;
+    }
+    for (int i = 0; i < MC_OUT_SLOTS; i++) free(d->slots[i].yuv);
     if (d->mc) { AMediaCodec_stop(d->mc); AMediaCodec_delete(d->mc); }
     free(d->lastFrame);
 #endif
@@ -551,16 +730,27 @@ void sr_h264_destroy(int id) {
 void sr_h264_feed(int id, const uint8_t *data, uint32_t len) {
     if (id < 0 || id >= MAX_DEC || !s_dec[id].used || !data || !len) return;
     Dec *d = &s_dec[id];
-    if (d->failed) return;
-    if (!buf_reserve(&d->ps, &d->psCap, d->psLen + len)) return;
-    memcpy(d->ps + d->psLen, data, len);
-    d->psLen += len;
-    while (ps_parse_one(d)) {}
-    if (d->psPos > (1u << 20)) {            /* drop the parsed prefix */
-        memmove(d->ps, d->ps + d->psPos, d->psLen - d->psPos);
-        d->psLen -= d->psPos;
-        d->psPos = 0;
+#ifdef __ANDROID__
+    if (d->thStarted) pthread_mutex_lock(&d->mu);
+#endif
+    if (!d->failed) {
+        if (buf_reserve(&d->ps, &d->psCap, d->psLen + len)) {
+            memcpy(d->ps + d->psLen, data, len);
+            d->psLen += len;
+            while (ps_parse_one(d)) {}
+            if (d->psPos > (1u << 20)) {            /* drop the parsed prefix */
+                memmove(d->ps, d->ps + d->psPos, d->psLen - d->psPos);
+                d->psLen -= d->psPos;
+                d->psPos = 0;
+            }
+        }
     }
+#ifdef __ANDROID__
+    if (d->thStarted) {
+        pthread_cond_signal(&d->cond_in);
+        pthread_mutex_unlock(&d->mu);
+    }
+#endif
 }
 
 /* Bytes fed but not yet handed to the decoder (unparsed PS + queued ES). mpeg.c derives the
@@ -568,11 +758,17 @@ void sr_h264_feed(int id, const uint8_t *data, uint32_t len) {
 uint32_t sr_h264_pending_bytes(int id) {
     if (id < 0 || id >= MAX_DEC || !s_dec[id].used) return 0;
     Dec *d = &s_dec[id];
+#ifdef __ANDROID__
+    if (d->thStarted) pthread_mutex_lock(&d->mu);
+#endif
     uint32_t es = d->esLen - d->esCur;
     /* An unparsed PS tail shorter than one packet can be trailing padding that never forms a
      * complete element; counting it kept packetsAvail at 1 forever at end of stream, so the
      * game never saw the movie end (it froze on the opening's last frame). */
     uint32_t ps = d->psLen - d->psPos;
+#ifdef __ANDROID__
+    if (d->thStarted) pthread_mutex_unlock(&d->mu);
+#endif
     return (ps >= 2048 ? ps : 0) + es;
 }
 
@@ -623,92 +819,41 @@ int sr_h264_frame(int id, int eos, uint8_t *dst, int frameWidth, int pixelMode) 
         return 0; \
     } while (0)
 
-    /* 1. Fast path: grab any already-decoded output frame with 0 wait.
-     * 2. Feed all complete AUs currently buffered in d->es (no blocking).
-     * 3. Wait AT MOST ONCE (6000 us) if we fed new data and still need output. */
-    int fed_any = 0, waited_once = 0;
-    for (int guard = 0; guard < 16; guard++) {
-        AMediaCodecBufferInfo info;
-        int64_t out_wait_us = (fed_any && !waited_once && d->esCur >= d->esLen) ? 6000 : 0;
-        if (out_wait_us > 0) waited_once = 1;
-        ssize_t outIdx = AMediaCodec_dequeueOutputBuffer(d->mc, &info, out_wait_us);
-        if (outIdx == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
-            AMediaFormat *of = AMediaCodec_getOutputFormat(d->mc);
-            if (of) {
-                int32_t v = 0;
-                if (AMediaFormat_getInt32(of, AMEDIAFORMAT_KEY_WIDTH, &v) && v > 0) d->outW = v;
-                if (AMediaFormat_getInt32(of, AMEDIAFORMAT_KEY_HEIGHT, &v) && v > 0) d->outH = v;
-                if (AMediaFormat_getInt32(of, AMEDIAFORMAT_KEY_STRIDE, &v) && v > 0) d->outStride = v;
-                else d->outStride = d->outW;
-                if (AMediaFormat_getInt32(of, "slice-height", &v) && v > 0) d->sliceH = v;
-                else d->sliceH = d->outH;
-                if (AMediaFormat_getInt32(of, AMEDIAFORMAT_KEY_COLOR_FORMAT, &v)) d->colorFmt = v;
-                AMediaFormat_delete(of);
+    pthread_mutex_lock(&d->mu);
+    if (eos && !d->eos) {
+        d->eos = 1;
+        pthread_cond_signal(&d->cond_in);
+    }
+    if (d->qCount == 0 && !d->outEos && !d->failed) {
+        int has_work = (d->esLen > d->esCur || d->inFlight > 0 || d->eos);
+        if (has_work) {
+            long wait_ms = d->firstOut ? 8 : 35;
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            ts.tv_nsec += wait_ms * 1000000L;
+            if (ts.tv_nsec >= 1000000000L) {
+                ts.tv_sec += ts.tv_nsec / 1000000000L;
+                ts.tv_nsec %= 1000000000L;
             }
-            continue;
-        }
-        if (outIdx == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) continue;
-        if (outIdx >= 0) {
-            size_t osz = 0;
-            uint8_t *obuf = AMediaCodec_getOutputBuffer(d->mc, (size_t)outIdx, &osz);
-            if (obuf && dst && info.size > 0) {
-                convert_frame_android(d, obuf + info.offset, (uint32_t)info.size, dst, frameWidth, pixelMode);
-                SAVE_LAST();
+            while (d->qCount == 0 && !d->outEos && !d->failed) {
+                if (pthread_cond_timedwait(&d->cond_out, &d->mu, &ts) != 0) break;
             }
-            AMediaCodec_releaseOutputBuffer(d->mc, (size_t)outIdx, false);
-            return 1;
-        }
-        if (d->esCur < d->esLen) {
-            uint32_t end = next_aud(d, d->esCur + 4);
-            if (end >= d->esLen && !eos) {
-                if (fed_any && !waited_once) {
-                    waited_once = 1;
-                    outIdx = AMediaCodec_dequeueOutputBuffer(d->mc, &info, 6000);
-                    if (outIdx >= 0) {
-                        size_t osz = 0;
-                        uint8_t *obuf = AMediaCodec_getOutputBuffer(d->mc, (size_t)outIdx, &osz);
-                        if (obuf && dst && info.size > 0) {
-                            convert_frame_android(d, obuf + info.offset, (uint32_t)info.size, dst, frameWidth, pixelMode);
-                            SAVE_LAST();
-                        }
-                        AMediaCodec_releaseOutputBuffer(d->mc, (size_t)outIdx, false);
-                        return 1;
-                    }
-                }
-                MISS_RET();
-            }
-            uint32_t len = end - d->esCur;
-            ssize_t inIdx = AMediaCodec_dequeueInputBuffer(d->mc, 0);
-            if (inIdx < 0) {
-                if (!waited_once) { fed_any = 1; continue; }
-                MISS_RET();
-            }
-            size_t isz = 0;
-            uint8_t *ibuf = AMediaCodec_getInputBuffer(d->mc, (size_t)inIdx, &isz);
-            if (!ibuf || len > isz) {
-                AMediaCodec_queueInputBuffer(d->mc, (size_t)inIdx, 0, 0, 0, 0);
-                MISS_RET();
-            }
-            memcpy(ibuf, d->es + d->esCur, len);
-            AMediaCodec_queueInputBuffer(d->mc, (size_t)inIdx, 0, len, (uint64_t)d->nextTimeUs, 0);
-            d->esCur = end;
-            d->nextTimeUs += 33367;
-            es_compact(d);
-            fed_any = 1;
-        } else if (eos && !d->drained) {
-            ssize_t inIdx = AMediaCodec_dequeueInputBuffer(d->mc, 1000);
-            if (inIdx >= 0) {
-                d->drained = 1;
-                AMediaCodec_queueInputBuffer(d->mc, (size_t)inIdx, 0, 0, 0, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
-                fed_any = 1;
-            } else MISS_RET();
-        } else if ((fed_any || d->drained) && !waited_once) {
-            fed_any = 1;
-            continue;
-        } else {
-            MISS_RET();
         }
     }
+    if (d->qCount > 0) {
+        MCOutSlot *s = &d->slots[d->qHead];
+        if (dst && s->len > 0) {
+            convert_frame_android(s, dst, frameWidth, pixelMode);
+        }
+        d->qHead = (d->qHead + 1) % MC_OUT_SLOTS;
+        d->qCount--;
+        d->firstOut = 1;
+        pthread_cond_signal(&d->cond_in);
+        pthread_mutex_unlock(&d->mu);
+        if (dst) SAVE_LAST();
+        return 1;
+    }
+    pthread_mutex_unlock(&d->mu);
     MISS_RET();
     #undef SAVE_LAST
     #undef MISS_RET
