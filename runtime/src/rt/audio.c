@@ -50,6 +50,7 @@ static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 static AAudioStream *s_aa_stream = NULL;
 static int16_t s_aa_last_l = 0, s_aa_last_r = 0;
 static volatile int s_aa_reopening = 0;
+static volatile int32_t s_aa_burst = 882;
 #endif
 static int s_inited = 0, s_ok = 0;
 
@@ -180,7 +181,13 @@ static int aaudio_open_stream(void) {
         return 0;
     }
     int32_t burst = AAudioStream_getFramesPerBurst(s_aa_stream);
-    if (burst > 0) AAudioStream_setBufferSizeInFrames(s_aa_stream, burst * 4);
+    int32_t cap = AAudioStream_getBufferCapacityInFrames(s_aa_stream);
+    if (burst > 0) {
+        s_aa_burst = burst;
+        int32_t target = burst * 6;
+        if (cap > 0 && target > cap) target = cap;
+        AAudioStream_setBufferSizeInFrames(s_aa_stream, target);
+    }
     r = AAudioStream_requestStart(s_aa_stream);
     if (r != AAUDIO_OK) {
         fprintf(stderr, "audio: AAudio requestStart failed (%d)\n", (int)r);
@@ -207,9 +214,9 @@ int sr_audio_init(void) {
  * volL/volR are 0..0x8000 (PSP panned-output volumes). */
 unsigned long g_audio_frames[8];         /* frames submitted per channel (SR_SCHEDSTAT) */
 
-static volatile uint64_t s_max_ahead = 4096;
+static volatile uint64_t s_max_ahead = 16384;
 void sr_audio_set_max_ahead(int frames) {
-    if (frames < 2048) frames = 2048;
+    if (frames < 8192) frames = 8192;
     if (frames > RING_FRAMES) frames = RING_FRAMES;
     s_max_ahead = (uint64_t)frames;
 }
@@ -243,7 +250,7 @@ void sr_audio_push(int ch, const int16_t *lr, int nframes, int volL, int volR) {
     {
         const uint64_t max_ahead = s_max_ahead;
         if (w > s_play + max_ahead) {
-            uint64_t snap = s_play + 2048;
+            uint64_t snap = s_play + 4096;
             for (uint64_t k = snap; k < w; k++) {
                 uint32_t idx = (uint32_t)(k & RING_MASK);
                 s_accL[idx] = s_accR[idx] = 0;
@@ -267,7 +274,10 @@ void sr_audio_push(int ch, const int16_t *lr, int nframes, int volL, int volR) {
  * ahead of the playhead or the block is taken half-written. */
 int sr_audio_block_frames(void) {
 #ifdef __ANDROID__
-    return 1536;                          /* ~34.8 ms lead cushion ahead of AAudio bursts */
+    int b = (int)s_aa_burst * 3;
+    if (b < 2048) b = 2048;
+    if (b > 4096) b = 4096;
+    return b;                             /* >= 3 AAudio bursts ahead to prevent underrun crackle */
 #else
     return BLOCK_FRAMES;
 #endif

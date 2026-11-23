@@ -586,7 +586,33 @@ public class ThirdBirthdayActivity extends SDLActivity {
         tv.setTextSize(11.5f);
         tv.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         Spinner sp = new Spinner(this);
-        ArrayAdapter<String> ad = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, items);
+        sp.setBackground(crimsonBox(0xCC1E1015, 0x88FCA5A5, 4, 1.0f));
+        sp.setPadding((int) (8 * dp), (int) (4 * dp), (int) (8 * dp), (int) (4 * dp));
+        ArrayAdapter<String> ad = new ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, items) {
+            @Override
+            public View getView(int position, View convertView, ViewGroup parentView) {
+                View v = super.getView(position, convertView, parentView);
+                if (v instanceof TextView) {
+                    ((TextView) v).setTextColor(Color.WHITE);
+                    ((TextView) v).setTypeface(Typeface.MONOSPACE);
+                    ((TextView) v).setTextSize(11.5f);
+                }
+                return v;
+            }
+            @Override
+            public View getDropDownView(int position, View convertView, ViewGroup parentView) {
+                View v = super.getDropDownView(position, convertView, parentView);
+                if (v instanceof TextView) {
+                    ((TextView) v).setTextColor(Color.WHITE);
+                    ((TextView) v).setBackgroundColor(0xFF1A0D12);
+                    ((TextView) v).setTypeface(Typeface.MONOSPACE);
+                    ((TextView) v).setTextSize(12f);
+                    int pad = (int) (10 * getResources().getDisplayMetrics().density);
+                    v.setPadding(pad, pad, pad, pad);
+                }
+                return v;
+            }
+        };
         ad.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         sp.setAdapter(ad);
         sp.setSelection(sel);

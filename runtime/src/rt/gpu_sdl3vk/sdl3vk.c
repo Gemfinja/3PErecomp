@@ -680,7 +680,9 @@ static void toast_record(VkImage dst) {
         s_fps_shown = s_fps_game = 0; s_fps_t0 = now;
     }
     if (sdl3vk_show_fps() && s_fps_v) {
-        snprintf(s_fps.msg, sizeof(s_fps.msg), "%d FPS   (game %d)", s_fps_v, s_fps_gv);
+        static const char *const k_ptag[4] = { "", "  [L30%]", "  [M60%]", "  [H85%]" };
+        int p = (s_perf_profile >= 0 && s_perf_profile <= 3) ? s_perf_profile : 0;
+        snprintf(s_fps.msg, sizeof(s_fps.msg), "%d FPS   (game %d)%s", s_fps_v, s_fps_gv, k_ptag[p]);
         int px = dh / 40; if (px < 12) px = 12; if (px > 40) px = 40;
         if (label_render(&s_fps, px, 0) && s_fps.w + px < dw && s_fps.h + px < dh)
             label_copy(&s_fps, dst, px / 2, px / 2);
@@ -1013,7 +1015,7 @@ static void shot_save(void) {
  *   render_scale=0   (0 = match the display: the smallest scale that covers its height)
  * A missing graphics.cfg is written with the default so it can be edited. */
 /* graphics.cfg: "key=integer" lines. */
-#define GCFG_MAX 16
+#define GCFG_MAX 64
 static int gcfg_load(char keys[GCFG_MAX][40], int *vals) {
     int n = 0;
     FILE *f = fopen("graphics.cfg", "r");
@@ -1313,22 +1315,79 @@ int sdl3vk_init(const char *title) {
 #ifdef __ANDROID__
 #include <sched.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <dlfcn.h>
 #include <sys/resource.h>
 #include <jni.h>
 static pid_t s_game_tid = 0;
+
+/* Dynamic ADPF (APerformanceHint) from libandroid.so (API 33+) for continuous per-frame boosting */
+typedef void *(*pfn_aph_get_mgr)(void);
+typedef void *(*pfn_aph_create)(void *, const int32_t *, size_t, int64_t);
+typedef void  (*pfn_aph_close)(void *);
+typedef int   (*pfn_aph_report)(void *, int64_t);
+typedef int   (*pfn_aph_target)(void *, int64_t);
+static void  *s_aph_mgr = NULL;
+static void  *s_aph_sess = NULL;
+static int    s_aph_inited = 0;
+static int    s_aph_profile = -1;
+static pfn_aph_create s_aph_create = NULL;
+static pfn_aph_close  s_aph_close  = NULL;
+static pfn_aph_report s_aph_report = NULL;
+static pfn_aph_target s_aph_target = NULL;
+
+static void adpf_init_once(void) {
+    if (s_aph_inited) return;
+    s_aph_inited = 1;
+    void *lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
+    if (!lib) return;
+    pfn_aph_get_mgr get_mgr = (pfn_aph_get_mgr)dlsym(lib, "APerformanceHint_getManager");
+    s_aph_create = (pfn_aph_create)dlsym(lib, "APerformanceHint_createSession");
+    s_aph_close  = (pfn_aph_close)dlsym(lib, "APerformanceHint_closeSession");
+    s_aph_report = (pfn_aph_report)dlsym(lib, "APerformanceHint_reportActualWorkDuration");
+    s_aph_target = (pfn_aph_target)dlsym(lib, "APerformanceHint_updateTargetWorkDuration");
+    if (get_mgr && s_aph_create && s_aph_close && s_aph_report) {
+        s_aph_mgr = get_mgr();
+        fprintf(stderr, "hwprofile: NDK ADPF manager=%p\n", s_aph_mgr);
+    }
+}
+
+static int collect_game_tids(int32_t *out, int max_out) {
+    int n = 0;
+    DIR *d = opendir("/proc/self/task");
+    if (!d) {
+        if (s_game_tid > 0 && max_out > 0) out[n++] = (int32_t)s_game_tid;
+        return n;
+    }
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL && n < max_out) {
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+        pid_t tid = (pid_t)atoi(de->d_name);
+        if (tid <= 0) continue;
+        char path[64], comm[32] = {0};
+        snprintf(path, sizeof(path), "/proc/self/task/%d/comm", (int)tid);
+        FILE *f = fopen(path, "r");
+        if (f) { fgets(comm, sizeof(comm), f); fclose(f); }
+        /* Keep audio/binder threads on system scheduler; boost all game/render/worker threads */
+        if (strstr(comm, "Audio") || strstr(comm, "AAudio") || strstr(comm, "Binder")) continue;
+        out[n++] = (int32_t)tid;
+    }
+    closedir(d);
+    return n;
+}
+
 static void apply_hw_profile_native(int profile) {
-    pid_t tid = s_game_tid;
-    if (tid <= 0) return;
+    adpf_init_once();
     int ncpu = (int)sysconf(_SC_NPROCESSORS_CONF);
     if (ncpu < 1) ncpu = 8;
     cpu_set_t mask;
     CPU_ZERO(&mask);
     int prio = 0;
-    if (profile == 1) { /* Light 30%: efficiency/mid cores */
-        int lim = ncpu > 5 ? 5 : ncpu;
+    if (profile == 1) { /* Light 30%: efficiency cores (0..3 on 8-core) */
+        int lim = ncpu >= 8 ? 4 : (ncpu > 2 ? ncpu / 2 : ncpu);
         for (int c = 0; c < lim; c++) CPU_SET(c, &mask);
-        prio = 2;
-    } else if (profile == 2) { /* Medium 60%: mid + big cores */
+        prio = 4;
+    } else if (profile == 2) { /* Medium 60%: mid + big cores (2..6, saves prime X1) */
         int lo = ncpu >= 8 ? 2 : 0;
         int hi = ncpu >= 8 ? 7 : ncpu;
         for (int c = lo; c < hi; c++) CPU_SET(c, &mask);
@@ -1336,14 +1395,47 @@ static void apply_hw_profile_native(int profile) {
     } else if (profile == 3) { /* High 85%: Big + Prime cores (Cortex-A78 + Cortex-X1) */
         int lo = ncpu >= 8 ? 4 : (ncpu > 2 ? ncpu / 2 : 0);
         for (int c = lo; c < ncpu; c++) CPU_SET(c, &mask);
-        prio = -10;
+        prio = -8;
     } else { /* Default: all cores */
         for (int c = 0; c < ncpu; c++) CPU_SET(c, &mask);
         prio = 0;
     }
-    sched_setaffinity(tid, sizeof(mask), &mask);
-    setpriority(PRIO_PROCESS, (id_t)tid, prio);
-    fprintf(stderr, "hwprofile: profile=%d tid=%d ncpu=%d prio=%d\n", profile, (int)tid, ncpu, prio);
+    int32_t tids[64];
+    int ntids = collect_game_tids(tids, 64);
+    int ok_aff = 0;
+    for (int i = 0; i < ntids; i++) {
+        if (sched_setaffinity((pid_t)tids[i], sizeof(mask), &mask) == 0) ok_aff++;
+        setpriority(PRIO_PROCESS, (id_t)tids[i], prio);
+    }
+    if (s_aph_mgr) {
+        if (s_aph_sess && (profile == 0 || s_aph_profile != profile)) {
+            s_aph_close(s_aph_sess);
+            s_aph_sess = NULL;
+        }
+        if (profile > 0 && !s_aph_sess && ntids > 0) {
+            int64_t target_ns = (profile == 1) ? 33333333LL : (profile == 2) ? 16666666LL : 8333333LL;
+            s_aph_sess = s_aph_create(s_aph_mgr, tids, (size_t)ntids, target_ns);
+            s_aph_profile = profile;
+        }
+        if (s_aph_sess) {
+            int64_t act_ns = (profile == 1) ? 9000000LL : (profile == 2) ? 15000000LL : 13500000LL;
+            s_aph_report(s_aph_sess, act_ns);
+        }
+    }
+    fprintf(stderr, "hwprofile: profile=%d tids=%d aff_ok=%d ncpu=%d prio=%d adpf=%p\n",
+            profile, ntids, ok_aff, ncpu, prio, s_aph_sess);
+}
+static void adpf_tick_frame(int64_t frame_ns) {
+    if (!s_aph_sess || !s_aph_report) return;
+    int64_t act = frame_ns;
+    if (s_perf_profile == 1) {
+        if (act > 12000000LL) act = 12000000LL;
+    } else if (s_perf_profile == 2) {
+        if (act < 14500000LL) act = 14500000LL;
+    } else if (s_perf_profile == 3) {
+        if (act < 12500000LL) act = 12500000LL;
+    }
+    s_aph_report(s_aph_sess, act);
 }
 __attribute__((visibility("default")))
 JNIEXPORT jint JNICALL Java_com_thirdbirthday_recomp_ThirdBirthdayActivity_nativeGetGameTid(
@@ -1385,7 +1477,7 @@ JNIEXPORT void JNICALL Java_com_thirdbirthday_recomp_ThirdBirthdayActivity_nativ
     s_sat = saturation < 50 ? 50 : saturation > 150 ? 150 : saturation;
     s_perf_profile = perfProfile < 0 ? 0 : perfProfile > 3 ? 3 : perfProfile;
     sdl3vk_cfg_set("perf_profile", s_perf_profile);
-    sr_audio_set_max_ahead(s_perf_profile >= 2 ? 2560 : 4096);
+    sr_audio_set_max_ahead(16384);
     apply_hw_profile_native(s_perf_profile);
     sdl3vk_cfg_set("fsr", s_fsr_on);
     sdl3vk_cfg_set("fsr_sharpness", s_fsr_sharp);
@@ -1826,12 +1918,25 @@ static int recreate_surface_and_swapchain(void) {
 }
 
 static int present_common(VkImage src, int srcw, int srch, int do_upload) {
+    static int s_fence_pending = 0;
 #ifdef __ANDROID__
+    static Uint64 s_prev_frame_ns = 0;
+    static unsigned s_frame_cnt = 0;
+    const Uint64 frame_now_ns = SDL_GetTicksNS();
     if (s_game_tid == 0) {
         s_game_tid = gettid();
         int p = sdl3vk_perf_profile();
         if (p > 0) apply_hw_profile_native(p);
     }
+    s_frame_cnt++;
+    if (s_frame_cnt == 120) {
+        int p = sdl3vk_perf_profile();
+        if (p > 0) apply_hw_profile_native(p);
+    }
+    if ((s_frame_cnt & 3u) == 0 && s_prev_frame_ns) {
+        adpf_tick_frame((int64_t)(frame_now_ns - s_prev_frame_ns));
+    }
+    s_prev_frame_ns = frame_now_ns;
 #endif
     int quit = 0;
     poll_input(&quit);
@@ -1862,6 +1967,11 @@ static int present_common(VkImage src, int srcw, int srch, int do_upload) {
         }
         if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) return 1;
 
+        if (s_fence_pending) {
+            vkWaitForFences(s_dev, 1, &s_fence, VK_TRUE, UINT64_MAX);
+            vkResetFences(s_dev, 1, &s_fence);
+            s_fence_pending = 0;
+        }
         VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkResetCommandBuffer(s_cmd, 0);
@@ -2006,6 +2116,7 @@ static int present_common(VkImage src, int srcw, int srch, int do_upload) {
         si.pSignalSemaphores = &s_sem_done[idx];
         VkResult sr = vkQueueSubmit(s_queue, 1, &si, s_fence);
         if (sr != VK_SUCCESS) fprintf(stderr, "sdl3vk: vkQueueSubmit failed: %d\n", (int)sr);
+        else s_fence_pending = 1;
 
         VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
         pi.waitSemaphoreCount = 1;
@@ -2016,8 +2127,11 @@ static int present_common(VkImage src, int srcw, int srch, int do_upload) {
         VkResult pr = vkQueuePresentKHR(s_queue, &pi);
         if (pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR) fprintf(stderr, "sdl3vk: vkQueuePresentKHR=%d\n", (int)pr);
 
-        vkWaitForFences(s_dev, 1, &s_fence, VK_TRUE, UINT64_MAX);
-        vkResetFences(s_dev, 1, &s_fence);
+        if (s_shot_req && s_fence_pending) {
+            vkWaitForFences(s_dev, 1, &s_fence, VK_TRUE, UINT64_MAX);
+            vkResetFences(s_dev, 1, &s_fence);
+            s_fence_pending = 0;
+        }
         shot_save();
         /* SR_PACELOG=1: every 5 s, how many frames reached the screen and how evenly */
         {
