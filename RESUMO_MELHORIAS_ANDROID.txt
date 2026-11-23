@@ -1,0 +1,92 @@
+========================================================================
+THE 3RD BIRTHDAY RECOMP (v0.9.16) - PORT ANDROID (arm64-v8a)
+Resumo das Implementacoes e Otimizacoes Realizadas
+========================================================================
+
+1. AUDIO NATIVO COM AAUDIO (runtime/src/rt/audio.c, CMakeLists.txt)
+------------------------------------------------------------------------
+- Removido completamente o subsistema de audio do SDL3 no Android
+  (SDL_AUDIO=OFF no CMakeLists.txt; SDL_Init sem SDL_INIT_AUDIO).
+- Substituido o backend OpenSL ES pelo AAudio nativo direto em C
+  (<aaudio/AAudio.h>, linkado com aaudio):
+  * Stream 44100 Hz stereo PCM_I16 em modo AAUDIO_PERFORMANCE_MODE_LOW_LATENCY.
+  * Buffer ajustado em 4 * framesPerBurst com callback em tempo real.
+  * Fade suave em eventuais underruns (63/64) para evitar estalos/crackle.
+  * Margem de 1536 frames (~34.8 ms) em sr_audio_block_frames() para
+    manter o mixer e o player de FMV sincronizados.
+  * Reabertura automatica da stream em thread separada quando ocorre
+    AAUDIO_ERROR_DISCONNECTED (ex.: conexao/desconexao de fone/Bluetooth).
+
+2. FMV POR HARDWARE (AMediaCodec + NEON + Anti-Rollback)
+   (runtime/src/rt/h264_mf.c)
+------------------------------------------------------------------------
+- Decodificacao H.264 por hardware via NDK AMediaCodec (libmediandk).
+- Conversao NV12 -> RGBA8888 vetorizada com ARM64 NEON SIMD (<arm_neon.h>),
+  processando 16 pixels por iteracao com aritmetica int32 sem overflow.
+- Corrigido o loop de sr_h264_frame():
+  * Busca frames prontos imediatamente com 0 us de espera.
+  * Alimenta todos os access units completos disponiveis no buffer sem
+    bloquear.
+  * Espera no maximo uma unica vez (ate 6000 us) apos o feed.
+- Removida a flag "low-latency"=1 para permitir reordenamento correto de
+  B-frames na ordem de exibicao (PTS).
+- Adicionado cache do ultimo frame valido (lastFrame): em qualquer miss do
+  decodificador sobre buffers alternados (A/B), copia o frame imediatamente
+  anterior para evitar rollback visual para frames antigos.
+
+3. OTIMIZACOES DE CPU, GE E VULKAN
+   (CMakeLists.txt, runtime/src/rt/ge.c, runtime/src/rt/gpu_sdl3vk/sdl3vk.c)
+------------------------------------------------------------------------
+- Flags de compilacao otimizadas para ARM64 moderno em libgame.so,
+  libmain.so, at3_standalone e xbrz:
+  -O3 -fno-math-errno -mtune=cortex-x1 -fomit-frame-pointer -ffp-contract=fast
+  (com -flto=thin em libmain.so).
+- runtime/src/rt/ge.c:
+  * Reuso direto de vertices transformados em TRIANGLE_STRIP e TRIANGLE_FAN
+    em draw_prim() (reduzindo chamadas a transform_vtx_clip() em ~3x).
+  * Cache de vertices pos-transformacao (64 entradas) para TRIANGLES
+    indexados.
+  * Remocao do registro % 96 por comando GE no loop principal no Android.
+- runtime/src/rt/gpu_sdl3vk/sdl3vk.c:
+  * Ignorado VK_SUBOPTIMAL_KHR no Android (recriando swapchain apenas em
+    VK_ERROR_OUT_OF_DATE_KHR ou VK_ERROR_SURFACE_LOST_KHR).
+  * Eliminado vkCmdClearColorImage + barreira de memoria quando a imagem
+    widescreen/FSR ja cobre 100% da tela.
+  * Cache de getenv("SR_KEYLOG") fora do loop por frame.
+  * Recuperacao limpa de superficie Vulkan ao minimizar/restaurar o app.
+
+4. SAVES PERSISTENTES E DIALOGO NATIVO DE SAVE/LOAD
+   (AndroidManifest.xml, LauncherActivity.java, ThirdBirthdayActivity.java,
+    runtime/src/rt/gui.c, runtime/src/rt/savedata.c)
+------------------------------------------------------------------------
+- Corrigido o stack overflow na JVM ao abrir dialogos usando
+  sched_run_on_main_stack() para gui_vblank() e gui_dialog().
+- Corrigidos separadores de caminho (\ -> /) em savedata.c para gravacao
+  correta em memstick/PSP/SAVEDATA/<jogo+slot>/.
+- Criado dialogo nativo de Save/Load em estilo Crimson CTI no Android
+  (ThirdBirthdayActivity.showSaveDialogFromNative) com selecao por toque,
+  detalhes do slot, botoes CONFIRMAR/CANCELAR e suporte a controle fisico.
+- Saves persistentes fora dos dados temporarios do APK:
+  * Adicionado MANAGE_EXTERNAL_STORAGE e android:hasFragileUserData="true"
+    no AndroidManifest.xml.
+  * Migracao automatica dos saves existentes para
+    /sdcard/The3rdBirthday/memstick (SR_MEMSTICK), mantendo os saves
+    intactos entre compilacoes, atualizacoes e desinstalacoes.
+
+5. CONTROLES, MIRA E INTERFACE
+   (twinstick.c, TouchControlsView.java, ThirdBirthdayActivity.java,
+    LauncherActivity.java, sdl3vk.c)
+------------------------------------------------------------------------
+- Corrigida a mira no twinstick.c: removido o fallback s_aim_stick = 1 em
+  aim_check() que desviava o analogico direito/toque para o analogico
+  esquerdo (*lx/*ly) e fazia a personagem andar enquanto mirava.
+- HUD tatil customizada (assets/hud/*.png) com analogico esquerdo livre na
+  metade esquerda, mira 1:1 nativa na metade direita, editor de layout
+  arrastavel in-game, respeito ao recorte da camera (DisplayCutout) e
+  ocultacao automatica quando um controle externo esta conectado.
+- Launcher e Mod Menu em tema Crimson The 3rd Birthday com FSR 1.0
+  (EASU + RCAS), Nitidez, Brilho/Contraste/Saturacao, Frame Gen 60 FPS,
+  xBRZ, Filtro de Textura, Texture Packs HD, Prompts PSP/Xbox, Resolucao
+  Interna (Auto + 1x-5x), Widescreen, Glow, Mostrar FPS e tela cheia
+  edge-to-edge.
+========================================================================

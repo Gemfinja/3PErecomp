@@ -1,0 +1,433 @@
+/* Bring-up driver for the recompiled C (Phase 3 differential).
+ *
+ * Loads a statically-linked PSP ELF into guest memory, seeds the CpuState from the entry
+ * register state the PPSSPP reference trace recorded ("# init" line in the trace), registers
+ * every generated function, and runs the entry function with tracing on. Execution stops
+ * cleanly at the first HLE call (sr_hle_call longjmps), exactly where the reference trace is
+ * truncated for comparison.
+ *
+ * Usage: driver <elf> <ref-trace> <out-trace>
+ */
+
+#define _CRT_SECURE_NO_WARNINGS
+#include "recomp.h"
+#ifndef SR_VERSION
+#define SR_VERSION "0.0.0"
+#endif
+#define SR_VERSION_STR SR_VERSION
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include "posix_compat.h"
+#include <dlfcn.h>
+#include <SDL3/SDL.h>
+#ifdef __ANDROID__
+#include <SDL3/SDL_main.h>
+#endif
+#endif
+
+/* The recompiled game code lives in game.dll, built on the player's PC from their own disc
+ * (tools/prepare.py); load it and give it the runtime's table (recomp.h SrApi). */
+extern int sr_sched_on; extern int32_t sr_timeslice;
+uint32_t sr_lwl(uint32_t, uint32_t); uint32_t sr_lwr(uint32_t, uint32_t);
+void sr_swl(uint32_t, uint32_t); void sr_swr(uint32_t, uint32_t);
+static int load_game(void) {
+    const char *name = getenv("SR_GAME_DLL");
+#ifdef _WIN32
+    HMODULE m = LoadLibraryA(name && *name ? name : "game.dll");
+    if (!m) {
+        MessageBoxA(NULL, "The game is not prepared yet.\n\nStart \"The 3rd Birthday.exe\" (the launcher) and choose your "
+                    "disc image: it builds the game from it once.", "The 3rd Birthday", MB_ICONINFORMATION);
+        return 0;
+    }
+    int (*attach)(const struct SrApi *, int) = (int (*)(const struct SrApi *, int))(void *)GetProcAddress(m, "sr_game_attach");
+    void (*reg)(void) = (void (*)(void))(void *)GetProcAddress(m, "sr_game_register_all");
+    extern int (*g_game_mods_hook)(CpuState *, uint32_t);
+    g_game_mods_hook = (int (*)(CpuState *, uint32_t))(void *)GetProcAddress(m, "sr_game_mods_hook");
+#else
+    void *m = dlopen(name && *name ? name : "libgame.so", RTLD_NOW);
+    if (!m) {
+        fprintf(stderr, "dlopen(libgame.so) failed: %s\n", dlerror());
+        return 0;
+    }
+    int (*attach)(const struct SrApi *, int) = (int (*)(const struct SrApi *, int))dlsym(m, "sr_game_attach");
+    void (*reg)(void) = (void (*)(void))dlsym(m, "sr_game_register_all");
+    extern int (*g_game_mods_hook)(CpuState *, uint32_t);
+    g_game_mods_hook = (int (*)(CpuState *, uint32_t))dlsym(m, "sr_game_mods_hook");
+#endif
+    static struct SrApi api;
+    api.mem = &g_mem; api.dbg = &g_sr_dbg; api.sched_on = &sr_sched_on; api.timeslice = &sr_timeslice;
+    api.oor = sr_oor; api.lwl = sr_lwl; api.lwr = sr_lwr; api.swl = sr_swl; api.swr = sr_swr;
+    api.vread = sr_vread; api.vwrite = sr_vwrite;
+    api.vfpu_rcp = sr_vfpu_rcp; api.vfpu_rsqrt = sr_vfpu_rsqrt; api.vfpu_sqrt = sr_vfpu_sqrt;
+    api.vfpu_sin = sr_vfpu_sin; api.vfpu_cos = sr_vfpu_cos; api.vfpu_exp2 = sr_vfpu_exp2; api.vfpu_ext = sr_vfpu_ext;
+    api.reg = sr_register; api.dispatch = dispatch; api.begin_dbg = sr_begin_dbg; api.end_dbg = sr_end_dbg;
+    api.func_hook = sr_func_hook; api.syscall = sr_syscall; api.yield = sr_yield;
+    api.unimplemented = sr_unimplemented; api.toast = gui_toast;
+    if (!attach || !reg || !attach(&api, SR_API_VERSION)) {
+#ifdef _WIN32
+        MessageBoxA(NULL, "game.dll is from another version of the port.\n\nStart \"The 3rd Birthday.exe\" (the launcher): "
+                    "it prepares the game again.", "The 3rd Birthday", MB_ICONWARNING);
+#else
+        fprintf(stderr, "libgame.so API version mismatch\n");
+#endif
+        return 0;
+    }
+    reg();
+    {   /* cheats: the instruction-patch flags in game.dll (none in a DLL from before cheats) */
+        extern uint8_t *g_patch_flags;
+#ifdef _WIN32
+        uint8_t *(*pf)(void) = (uint8_t *(*)(void))(void *)GetProcAddress(m, "sr_game_patch_flags");
+#else
+        uint8_t *(*pf)(void) = (uint8_t *(*)(void))dlsym(m, "sr_game_patch_flags");
+#endif
+        g_patch_flags = pf ? pf() : NULL;
+    }
+    return 1;
+}
+
+#ifdef _WIN32
+/* Last-resort crash reporter: a silent host fault (access violation etc.) otherwise kills
+ * the process with nothing in the log. Maps a faulting address inside the guest arena back
+ * to its guest address. */
+static LONG WINAPI sr_crash_filter(EXCEPTION_POINTERS *ep) {
+    EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    fprintf(stderr, "HOST CRASH: exception 0x%08lx at host %p\n",
+            er->ExceptionCode, er->ExceptionAddress);
+    {   /* which module: the fault, and code addresses found on the stack (callers). A C++
+         * exception (0xe06d7363) comes from a DLL in the process, e.g. an overlay or a driver
+         * (issue #17: ReShade), so name them. */
+        const void *seen[10]; int ns = 0;
+        const uintptr_t *sp = (const uintptr_t *)(uintptr_t)ep->ContextRecord->Rsp;
+        int nsp = 0;                                     /* stack words readable from sp */
+        {   MEMORY_BASIC_INFORMATION mi;
+            if (VirtualQuery(sp, &mi, sizeof(mi)) && mi.State == MEM_COMMIT) {
+                const uintptr_t end = (uintptr_t)mi.BaseAddress + mi.RegionSize;
+                nsp = (int)((end - (uintptr_t)sp) / sizeof(uintptr_t));
+                if (nsp > 256) nsp = 256;
+            } }
+        for (int i = -1; i < nsp && ns < 10; i++) {
+            const void *a = i < 0 ? er->ExceptionAddress : (const void *)sp[i];
+            HMODULE hm = NULL; char name[MAX_PATH];
+            if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                    (LPCSTR)a, &hm) || !hm) continue;
+            if (!GetModuleFileNameA(hm, name, sizeof(name))) continue;
+            int dup = 0;
+            for (int k = 0; k < ns; k++) if (seen[k] == (const void *)hm) dup = 1;
+            if (dup) continue;
+            seen[ns++] = (const void *)hm;
+            const char *base = strrchr(name, '\\');
+            fprintf(stderr, "  %s %s+0x%llx\n", i < 0 ? "in" : "via", base ? base + 1 : name,
+                    (unsigned long long)((uintptr_t)a - (uintptr_t)hm));
+        }
+    }
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2) {
+        const uint8_t *fa = (const uint8_t *)er->ExceptionInformation[1];
+        fprintf(stderr, "  %s of host %p", er->ExceptionInformation[0] ? "write" : "read", fa);
+        if (g_mem && fa >= g_mem - 0x04000000 && fa < g_mem + 0x04000000)
+            fprintf(stderr, " (guest 0x%08x)", (uint32_t)(fa - g_mem) + 0x08000000u);
+        fprintf(stderr, "\n");
+    }
+    fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;   /* still crash (after reporting) */
+}
+#endif
+
+static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+static uint16_t rd16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
+
+static uint8_t *read_file(const char *path, long *out_len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(2); }
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *d = (uint8_t *)malloc(n);
+    if (fread(d, 1, n, f) != (size_t)n) { fprintf(stderr, "short read\n"); exit(2); }
+    fclose(f);
+    *out_len = n;
+    return d;
+}
+
+static uint32_t load_elf(const uint8_t *elf) {
+    if (memcmp(elf, "\x7f""ELF", 4) != 0) { fprintf(stderr, "not an ELF\n"); exit(2); }
+    uint32_t e_entry = rd32(elf + 24);
+    uint32_t e_phoff = rd32(elf + 28);
+    uint16_t phentsize = rd16(elf + 42);
+    uint16_t phnum = rd16(elf + 44);
+    sr_mem_init();
+    for (uint16_t i = 0; i < phnum; i++) {
+        const uint8_t *ph = elf + e_phoff + (uint32_t)i * phentsize;
+        uint32_t p_type = rd32(ph + 0), p_off = rd32(ph + 4), p_vaddr = rd32(ph + 8);
+        uint32_t p_filesz = rd32(ph + 16);
+        if (p_type == 1 && p_filesz)  /* PT_LOAD */
+            sr_load_segment(p_vaddr, elf + p_off, p_filesz);
+    }
+    return e_entry;
+}
+
+static void seed_from_init(const char *trace_path, CpuState *s) {
+    FILE *f = fopen(trace_path, "rb");
+    if (!f) { fprintf(stderr, "cannot open %s\n", trace_path); exit(2); }
+    char buf[8192];
+    int found = 0;
+    while (fgets(buf, sizeof(buf), f)) {
+        if (strncmp(buf, "# init", 6) != 0)
+            continue;
+        found = 1;
+        char *tok = strtok(buf + 6, " \t\n");
+        while (tok) {
+            char *eq = strchr(tok, '=');
+            if (eq) {
+                *eq = 0;
+                uint32_t val = (uint32_t)strtoul(eq + 1, NULL, 16);
+                if (tok[0] == 'r') s->r[atoi(tok + 1)] = val;
+                else if (tok[0] == 'f' && tok[1] >= '0' && tok[1] <= '9') s->fi[atoi(tok + 1)] = val;
+                else if (strcmp(tok, "hi") == 0) s->hi = val;
+                else if (strcmp(tok, "lo") == 0) s->lo = val;
+                else if (strcmp(tok, "fcr31") == 0) s->fcr31 = val;
+            }
+            tok = strtok(NULL, " \t\n");
+        }
+        break;
+    }
+    fclose(f);
+    if (!found) { fprintf(stderr, "no '# init' in %s\n", trace_path); exit(2); }
+}
+
+/* The game program prepared from the player's disc (image.bin) must be the one the port was made
+ * for: the US release ULUS10567, version 1.00. Another release or a modified program builds
+ * fine but crashes at once (issue #10), so say so instead. "Start anyway" is remembered in
+ * launch.cfg for this image (Prepare rewrites launch.cfg). */
+#define IMAGE_SIZE 4913600L
+#define IMAGE_FNV  "c598c561ba3bd1f2"   /* FNV-1a 64 of image.bin from that release */
+static int image_id(const char *path, char hex[17]) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    uint64_t h = 0xcbf29ce484222325ull;
+    static unsigned char buf[1 << 16]; size_t n; long total = 0;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        for (size_t i = 0; i < n; i++) h = (h ^ buf[i]) * 0x100000001b3ull;
+        total += (long)n;
+    }
+    fclose(f);
+    snprintf(hex, 17, "%016llx", (unsigned long long)h);
+    if (total != IMAGE_SIZE) hex[0] = 'x';             /* another size: never the expected id */
+    return 1;
+}
+
+static void image_check(const char *image, const char *accepted) {
+    char hex[17] = "";
+    if (!image_id(image, hex) || !strcmp(hex, IMAGE_FNV) || !strcmp(hex, accepted)) return;
+    fprintf(stderr, "image: %s (id %s) is not the ULUS10567 v1.00 program\n", image, hex);
+    if (getenv("SR_OFFSCREEN")) return;                  /* tests: no dialog */
+#ifdef _WIN32
+    if (MessageBoxA(NULL, "This game was prepared from a disc image that is not the US release of\n"
+                    "The 3rd Birthday (ULUS10567, version 1.00), or the game program in it was changed.\n\n"
+                    "The port is made for that release only: it will most likely close right away.\n"
+                    "Use the launcher to choose your USA disc image and press Prepare game again.\n\n"
+                    "Start anyway?", "The 3rd Birthday", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+        exit(1);
+#endif
+    FILE *f = fopen("launch.cfg", "a");
+    if (f) { fprintf(f, "image_accepted=%s\n", hex); fclose(f); }
+}
+
+/* Started with no arguments (a double-click, a shortcut): run the game from the executable's
+ * folder. launch.cfg (written by scripts/build.sh) holds "image=", "base=", "entry=" and
+ * optionally "iso="; without iso= the first *.iso in the folder or up to three folders above
+ * is used. Logs go to run.err / run.out, and a console window opened only for us is closed. */
+static int launch_defaults(int *pargc, char ***pargv) {
+    static char exe[MAX_PATH] = "the3rdbirthday", image[MAX_PATH] = "image.bin", base[32] = "08804000", entry[32] = "",
+                iso[MAX_PATH] = "", accepted[24] = "";
+    static char *args[9];
+#ifdef _WIN32
+    GetModuleFileNameA(NULL, exe, sizeof(exe));
+    char dir[MAX_PATH]; snprintf(dir, sizeof(dir), "%s", exe);
+    char *sl = strrchr(dir, '\\'); if (sl) *sl = 0;
+    SetCurrentDirectoryA(dir);
+#elif defined(__ANDROID__)
+    const char *ext = SDL_GetAndroidExternalStoragePath();
+    if (ext && *ext) chdir(ext);
+    setenv("SR_SCHEDSTAT", "1", 1);
+    {
+        FILE *df = fopen("vulkan_driver.txt", "r");
+        if (!df) setenv("SR_NODUALSRC", "1", 1); else fclose(df);
+        FILE *of = fopen("android_opts.cfg", "r");
+        if (of) {
+            char line[128];
+            while (fgets(line, sizeof(line), of)) {
+                line[strcspn(line, "\r\n")] = 0;
+                if (strcmp(line, "gpu=0") == 0) setenv("SR_GPU_GE", "0", 1);
+                else if (strcmp(line, "nodualsrc=1") == 0) setenv("SR_NODUALSRC", "1", 1);
+                else if (strcmp(line, "nodualsrc=0") == 0) unsetenv("SR_NODUALSRC");
+            }
+            fclose(of);
+        }
+    }
+#endif
+    FILE *f = fopen("launch.cfg", "r");
+    if (!f) return 0;
+    char line[600];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (!strncmp(line, "image=", 6)) snprintf(image, sizeof(image), "%s", line + 6);
+        else if (!strncmp(line, "base=", 5)) snprintf(base, sizeof(base), "%s", line + 5);
+        else if (!strncmp(line, "entry=", 6)) snprintf(entry, sizeof(entry), "%s", line + 6);
+        else if (!strncmp(line, "iso=", 4)) snprintf(iso, sizeof(iso), "%s", line + 4);
+        else if (!strncmp(line, "image_accepted=", 15)) snprintf(accepted, sizeof(accepted), "%s", line + 15);
+    }
+    fclose(f);
+    if (!entry[0]) return 0;
+    if (!getenv("PSP_ISO")) {
+#ifdef __ANDROID__
+        if (iso[0] && GetFileAttributesA(iso) == INVALID_FILE_ATTRIBUTES) iso[0] = 0;
+#endif
+        if (!iso[0]) {
+            char pat[MAX_PATH + 16], up[MAX_PATH] = ".";
+            for (int depth = 0; depth < 4 && !iso[0]; depth++) {
+                WIN32_FIND_DATAA fd;
+                snprintf(pat, sizeof(pat), "%s/*.iso", up);
+                HANDLE h = FindFirstFileA(pat, &fd);
+                if (h != INVALID_HANDLE_VALUE) { snprintf(iso, sizeof(iso), "%s/%s", up, fd.cFileName); FindClose(h); }
+                snprintf(pat, sizeof(pat), "%s/..", up); snprintf(up, sizeof(up), "%s", pat);
+            }
+        }
+        if (!iso[0] || GetFileAttributesA(iso) == INVALID_FILE_ATTRIBUTES) {
+            char msg[MAX_PATH + 200];
+            snprintf(msg, sizeof(msg), "The disc image of the game was not found%s%s.\n\n"
+                     "Copy ULUS10567.iso to the app data folder.",
+                     iso[0] ? ":\n" : "", iso);
+#ifdef _WIN32
+            if (getenv("SR_OFFSCREEN")) {               /* tests: no dialog */
+                FILE *e = fopen("run.err", "w"); if (e) { fprintf(e, "%s\n", msg); fclose(e); }
+            } else MessageBoxA(NULL, msg, "The 3rd Birthday", MB_ICONERROR);
+#else
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "The 3rd Birthday", msg, NULL);
+#endif
+            exit(1);
+        }
+#ifdef _WIN32
+        if (iso[0]) { static char e[MAX_PATH + 16]; snprintf(e, sizeof(e), "PSP_ISO=%s", iso); _putenv(e); }
+#else
+        if (iso[0]) setenv("PSP_ISO", iso, 1);
+#endif
+    }
+    if (!getenv("PSP_VFPU_TABLES") && GetFileAttributesA("assets/vfpu") == INVALID_FILE_ATTRIBUTES) {
+        static const char *const cand[] = { "../../runtime/assets/vfpu", "../../assets/vfpu" };
+        for (unsigned i = 0; i < 2; i++)
+            if (GetFileAttributesA(cand[i]) != INVALID_FILE_ATTRIBUTES) {
+#ifdef _WIN32
+                static char e[96]; snprintf(e, sizeof(e), "PSP_VFPU_TABLES=%s", cand[i]); _putenv(e); break;
+#else
+                setenv("PSP_VFPU_TABLES", cand[i], 1); break;
+#endif
+            }
+    }
+    freopen("run.err", "w", stderr);
+    image_check(image, accepted);
+    freopen("run.out", "w", stdout);
+    setvbuf(stderr, NULL, _IONBF, 0);   /* the log is complete even after a crash */
+#ifdef _WIN32
+    {   /* a console window that exists only for this process (double-click): close it */
+        DWORD pids[2];
+        /* hidden, not freed: FreeConsole leaves the redirected stderr writing nowhere */
+        if (GetConsoleProcessList(pids, 2) == 1) ShowWindow(GetConsoleWindow(), SW_HIDE);
+    }
+#endif
+    args[0] = exe; args[1] = "--image"; args[2] = image; args[3] = base; args[4] = entry;
+    args[5] = "init.trace"; args[6] = "none"; args[7] = "--gui"; args[8] = NULL;
+    *pargc = 8; *pargv = args;
+    return 1;
+}
+
+int main(int argc, char **argv) {
+    uint32_t entry;
+    const char *ref_trace, *out;
+    if (argc <= 1 && !launch_defaults(&argc, &argv)) {
+#ifdef _WIN32
+        MessageBoxA(NULL, "launch.cfg is missing next to the game executable.\nBuild the game with scripts/build.ps1.",
+                    "The 3rd Birthday", MB_ICONERROR);
+#else
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "The 3rd Birthday", "launch.cfg is missing.", NULL);
+#endif
+        return 2;
+    }
+
+#ifdef _WIN32
+    if (GetModuleHandleA("RTSSHooks64.dll"))   /* issue #10: its overlay closes the game at start */
+        fprintf(stderr, "RivaTuner (RTSS) overlay is active. If the game closes right after starting, "
+                        "turn RivaTuner's on-screen display off for ULUS10567.exe.\n");
+    SetUnhandledExceptionFilter(sr_crash_filter);
+#endif
+    { extern void ctrlsrv_start(void); ctrlsrv_start(); }   /* SR_CTRL test channel */
+
+    /* Image mode: a pre-relocated flat image (e.g. a rebased PRX from tools/prxload.py) is
+     * loaded at <base> and run from <entry>. Required for relocatable PRXs, which must be
+     * rebased + relocated before they have concrete addresses.
+     *   driver --image <image.bin> <base-hex> <entry-hex> <ref-trace> <out-trace>  */
+    if (argc >= 7 && strcmp(argv[1], "--image") == 0) {
+        long len;
+        uint8_t *img = read_file(argv[2], &len);
+        uint32_t base = (uint32_t)strtoul(argv[3], NULL, 16);
+        entry = (uint32_t)strtoul(argv[4], NULL, 16);
+        ref_trace = argv[5];
+        out = argv[6];
+        sr_mem_init();
+        sr_load_segment(base, img, (uint32_t)len);
+        goto have_image;
+    }
+    if (argc < 4) {
+        fprintf(stderr, "usage: driver <elf> <ref-trace> <out-trace>\n"
+                        "       driver --image <image.bin> <base-hex> <entry-hex> <ref-trace> <out-trace>\n");
+        return 2;
+    }
+    {
+        long len;
+        uint8_t *elf = read_file(argv[1], &len);
+        entry = load_elf(elf);
+    }
+    ref_trace = argv[2];
+    out = argv[3];
+have_image:;
+
+    CpuState s;
+    memset(&s, 0, sizeof(s));
+    s.vfpuCtrl[0] = 0xe4;  /* SPREFIX = identity */
+    s.vfpuCtrl[1] = 0xe4;  /* TPREFIX = identity */
+    s.vfpuCtrl[2] = 0;     /* DPREFIX = none */
+    seed_from_init(ref_trace, &s);
+    s.pc = entry;
+
+    if (!load_game()) return 2;
+    /* "none" as the out path disables tracing -- much faster for HLE bring-up, where the goal
+     * is to reach the next unimplemented import rather than diff a trace. */
+    if (strcmp(out, "none") != 0 && sr_trace_open(out, "cgtest", entry) != 0) {
+        fprintf(stderr, "cannot open out trace %s\n", out);
+        return 2;
+    }
+    RecompFn fn = sr_lookup(entry);
+    if (!fn) { fprintf(stderr, "no recompiled function at entry 0x%08x\n", entry); return 2; }
+
+    int use_sched = 0;
+    for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--sched") == 0) use_sched = 1;
+    for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--gui") == 0) { gui_init("The 3rd Birthday  (PC port v" SR_VERSION_STR ")"); use_sched = 1; }
+
+    if (use_sched) {
+        /* Run with the cooperative scheduler so the game's threads interleave (the boot busy-
+         * waits on a sibling). sched_run uses s as the live register file for whichever thread
+         * runs; it returns when no thread is runnable, or the process exits at an unimplemented
+         * import inside a thread fiber. */
+        sched_init(&s);
+        sched_run(entry, s.r[4], s.r[5]);
+    } else if (setjmp(g_hle_jmp) == 0) {
+        fn(&s);
+    }
+    sr_trace_close();
+    fprintf(stderr, "done (hit_hle=%d)\n", sr_hit_hle);
+    return 0;
+}

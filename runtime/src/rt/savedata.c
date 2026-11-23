@@ -1,0 +1,849 @@
+/* sceUtilitySavedata: a persistent virtual memory stick.
+ *
+ * Save operations write real files under memstick/PSP/SAVEDATA/<gameName><saveName>/ next to
+ * the executable (override the root with SR_MEMSTICK), the same layout PPSSPP and a real PSP
+ * use, so saves can be copied between this build and PPSSPP. Field offsets and result codes
+ * follow PPSSPP's SceUtilitySavedataParam (Core/Dialog/SavedataParam.h); the earlier no-op
+ * implementation was also missing the abortStatus word, putting msFree/idList/fileList four
+ * bytes too low.
+ *
+ * Implemented modes: AUTOLOAD/LOAD/LISTLOAD read the data file back into dataBuf;
+ * AUTOSAVE/SAVE/LISTSAVE write dataBuf plus PARAM.SFO and the icon/pic/snd blobs;
+ * LIST enumerates this game's save directories; FILES lists a save's files; SIZES /
+ * GETSIZE report a roomy fake memory stick; the DELETE family removes a save directory.
+ */
+
+#define _CRT_SECURE_NO_WARNINGS
+#define WIN32_LEAN_AND_MEAN
+#include "recomp.h"
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include "posix_compat.h"
+#endif
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+/* SceUtilitySavedataParam offsets */
+enum {
+    SDP_result    = 0x1c,
+    SDP_mode      = 0x30,
+    SDP_gameName  = 0x3c,   /* char[13] */
+    SDP_saveName  = 0x4c,   /* char[20] */
+    SDP_saveNameList = 0x60,
+    SDP_fileName  = 0x64,   /* char[13] */
+    SDP_dataBuf   = 0x74,
+    SDP_dataBufSize = 0x78,
+    SDP_dataSize  = 0x7c,
+    SDP_sfoTitle  = 0x80,   /* char[0x80] */
+    SDP_sfoSaveTitle = 0x100, /* char[0x80] */
+    SDP_sfoDetail = 0x180,  /* char[0x400] */
+    SDP_sfoParental = 0x580,
+    SDP_icon0     = 0x584,  /* PspUtilitySavedataFileData: buf,bufSize,size,unk */
+    SDP_icon1     = 0x594,
+    SDP_pic1      = 0x5a4,
+    SDP_snd0      = 0x5b4,
+    SDP_msFree    = 0x5d0,
+    SDP_msData    = 0x5d4,
+    SDP_usedData  = 0x5d8,
+    SDP_idList    = 0x5f4,
+    SDP_fileList  = 0x5f8,
+    SDP_sizeInfo  = 0x5fc,
+};
+
+/* SceUtilitySavedataType (PPSSPP SavedataParam.h). The MAKEDATA/READDATA/WRITEDATA/ERASE
+ * family (13-21) is the no-dialog "secure" API many games use for the actual save IO after
+ * presenting their own UI; PPSSPP routes them to the same Save/Load/Delete actions. */
+enum { SD_AUTOLOAD=0, SD_AUTOSAVE=1, SD_LOAD=2, SD_SAVE=3, SD_LISTLOAD=4, SD_LISTSAVE=5,
+       SD_LISTDELETE=6, SD_LISTALLDELETE=7, SD_SIZES=8, SD_AUTODELETE=9, SD_DELETE=10,
+       SD_LIST=11, SD_FILES=12, SD_MAKEDATASECURE=13, SD_MAKEDATA=14, SD_READDATASECURE=15,
+       SD_READDATA=16, SD_WRITEDATASECURE=17, SD_WRITEDATA=18, SD_ERASESECURE=19,
+       SD_ERASE=20, SD_DELETEDATA=21, SD_GETSIZE=22 };
+
+#define ERR_LOAD_NO_DATA    0x80110307u
+#define ERR_LOAD_NOT_FOUND  0x80110309u
+#define ERR_DELETE_NO_DATA  0x80110347u
+#define ERR_RW_NO_DATA      0x80110327u
+#define ERR_RW_NOT_FOUND    0x80110329u
+#define ERR_RW_MS_FULL      0x80110323u
+#define ERR_SIZES_NO_DATA   0x801103C7u   /* SIZES on a save that doesn't exist yet (PPSSPP) */
+
+/* SceUtilitySavedataParam: bind result (offset 0x34, after mode). PPSSPP sets 1021 on every
+ * successful load -- "PSP always responds this and this unlocks some games". */
+#define SDP_bind 0x34
+
+#define CLUSTER 0x8000u          /* 32 KB "memory stick" cluster */
+#define FREE_CLUSTERS 0x4000u    /* pretend 512 MB free */
+
+static void rd_cstr(uint32_t addr, char *out, int max) {
+    int i = 0;
+    if (addr) for (; i < max - 1; i++) {
+        uint8_t c = MEM_R8(addr + (uint32_t)i);
+        if (!c) break;
+        out[i] = (char)c;
+    }
+    out[i] = 0;
+}
+
+static const char *ms_root(void) {
+    const char *r = getenv("SR_MEMSTICK");
+    return r && *r ? r : "memstick";
+}
+
+static void mkdirs(const char *path) {
+    char tmp[MAX_PATH];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/' || *p == '/') { *p = 0; CreateDirectoryA(tmp, NULL); *p = '/'; }
+    }
+    CreateDirectoryA(tmp, NULL);
+}
+
+/* memstick/PSP/SAVEDATA/<gameName><saveName> */
+static void save_dir(char *out, int cap, const char *game, const char *save) {
+    snprintf(out, cap, "%s/PSP/SAVEDATA/%s%s", ms_root(), game, save);
+}
+
+int gui_dialog(const char *title, const char *const *items, int n, const char *const *details,
+               int *sel, const char *help);
+static int sdlog(void) { static int v = -1; if (v < 0) v = getenv("SR_DLGLOG") ? 1 : 0; return v; }
+
+/* Safe write: the data goes to <name>.tmp first and replaces the file only when complete, so
+ * a crash or a full disk in the middle of a save never leaves a damaged save. */
+static int write_file(const char *dir, const char *name, const uint8_t *data, uint32_t n) {
+    char path[MAX_PATH], tmp[MAX_PATH + 8];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return 0;
+    int ok = !n || fwrite(data, 1, n, f) == n;
+    ok = fflush(f) == 0 && ok;
+    fclose(f);
+    if (ok) ok = MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    if (!ok) DeleteFileA(tmp);
+    return ok;
+}
+
+/* Before a save is overwritten, its folder is copied to <memstick>/BACKUP/<save>/<date-time>/
+ * (outside PSP/SAVEDATA, so the game never lists it); the newest 10 per save are kept. To
+ * restore one, copy its files back into PSP/SAVEDATA/<save>/. */
+static int dir_exists(const char *dir);
+static int name_cmp(const void *a, const void *b) { return strcmp((const char *)a, (const char *)b); }
+static void del_dir(const char *d) {
+    char pat[MAX_PATH], f[MAX_PATH * 2];
+    WIN32_FIND_DATAA fd;
+    snprintf(pat, sizeof(pat), "%s/*", d);
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            snprintf(f, sizeof(f), "%s/%s", d, fd.cFileName);
+            DeleteFileA(f);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    RemoveDirectoryA(d);
+}
+static void backup_save(const char *dir, const char *saveDir) {
+    char pat[MAX_PATH], root[MAX_PATH], dst[MAX_PATH + 32];
+    if (!dir_exists(dir)) return;
+    snprintf(root, sizeof(root), "%s/BACKUP/%s", ms_root(), saveDir);
+    SYSTEMTIME st; GetLocalTime(&st);
+    snprintf(dst, sizeof(dst), "%s/%04u%02u%02u-%02u%02u%02u", root, st.wYear, st.wMonth, st.wDay,
+             st.wHour, st.wMinute, st.wSecond);
+    if (dir_exists(dst)) return;              /* saved twice within a second: one copy is enough */
+    mkdirs(dst);
+    WIN32_FIND_DATAA fd;
+    snprintf(pat, sizeof(pat), "%s/*", dir);
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        char a[MAX_PATH * 2], b[MAX_PATH * 2];
+        snprintf(a, sizeof(a), "%s/%s", dir, fd.cFileName);
+        snprintf(b, sizeof(b), "%s/%s", dst, fd.cFileName);
+        CopyFileA(a, b, FALSE);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    static char names[64][32];               /* keep the newest 10 */
+    int n = 0;
+    snprintf(pat, sizeof(pat), "%s/*", root);
+    h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && fd.cFileName[0] != '.' && n < 64)
+            snprintf(names[n++], 32, "%s", fd.cFileName);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    qsort(names, (size_t)n, sizeof(names[0]), name_cmp);
+    for (int i = 0; i + 10 < n; i++) {
+        char old[MAX_PATH + 40];
+        snprintf(old, sizeof(old), "%s/%s", root, names[i]);
+        del_dir(old);
+    }
+}
+
+/* Write a guest FileData blob (icon0/icon1/pic1/snd0) if present. */
+static void write_filedata(const char *dir, const char *name, uint32_t fd) {
+    uint32_t buf = MEM_R32(fd + 0), size = MEM_R32(fd + 8);
+    if (buf && size && size < 0x400000)
+        write_file(dir, name, (const uint8_t *)SR_HOST(buf), size);
+}
+
+/* ---- minimal PARAM.SFO writer (PSF v1.1) -------------------------------------------------- */
+typedef struct { const char *key; uint16_t fmt; uint32_t len, maxlen; const void *val; } SfoEnt;
+
+static void sfo_write(const char *dir, const char *title, const char *saveTitle,
+                      const char *detail, const char *saveDir, uint32_t parental,
+                      const char *fileName) {
+    static uint8_t params[128], filelist[3168];   /* zeroed secure blocks */
+    /* FILE_LIST entry 0: {char name[13]; u8 hash[16]; u8 pad[3]} -- records the data file
+     * (hash left zero; we don't encrypt). */
+    memset(filelist, 0, sizeof(filelist));
+    if (fileName && fileName[0]) {
+        size_t fl = strlen(fileName); if (fl > 12) fl = 12;
+        memcpy(filelist, fileName, fl);
+    }
+    char cat[4] = "MS";
+    uint32_t pl = parental;
+    SfoEnt e[8];
+    int n = 0;
+    /* keys must be sorted alphabetically */
+    e[n++] = (SfoEnt){"CATEGORY",           0x0204, 3, 4, cat};
+    e[n++] = (SfoEnt){"PARENTAL_LEVEL",     0x0404, 4, 4, &pl};
+    e[n++] = (SfoEnt){"SAVEDATA_DETAIL",    0x0204, (uint32_t)strlen(detail) + 1, 1024, detail};
+    e[n++] = (SfoEnt){"SAVEDATA_DIRECTORY", 0x0204, (uint32_t)strlen(saveDir) + 1, 64, saveDir};
+    e[n++] = (SfoEnt){"SAVEDATA_FILE_LIST", 0x0004, sizeof(filelist), sizeof(filelist), filelist};
+    e[n++] = (SfoEnt){"SAVEDATA_PARAMS",    0x0004, sizeof(params), sizeof(params), params};
+    e[n++] = (SfoEnt){"SAVEDATA_TITLE",     0x0204, (uint32_t)strlen(saveTitle) + 1, 128, saveTitle};
+    e[n++] = (SfoEnt){"TITLE",              0x0204, (uint32_t)strlen(title) + 1, 128, title};
+
+    uint32_t keyOff[8], keySize = 0, dataOff[8], dataSize = 0;
+    for (int i = 0; i < n; i++) {
+        keyOff[i] = keySize; keySize += (uint32_t)strlen(e[i].key) + 1;
+        dataOff[i] = dataSize; dataSize += (e[i].maxlen + 3) & ~3u;
+    }
+    uint32_t keyStart = 20 + 16u * (uint32_t)n;
+    uint32_t dataStart = (keyStart + keySize + 3) & ~3u;
+
+    uint8_t *buf = (uint8_t *)calloc(1, dataStart + dataSize);
+    if (!buf) return;
+    memcpy(buf, "\0PSF", 4);
+    *(uint32_t *)(buf + 4) = 0x0101;
+    *(uint32_t *)(buf + 8) = keyStart;
+    *(uint32_t *)(buf + 12) = dataStart;
+    *(uint32_t *)(buf + 16) = (uint32_t)n;
+    for (int i = 0; i < n; i++) {
+        uint8_t *ix = buf + 20 + 16 * i;
+        *(uint16_t *)(ix + 0) = (uint16_t)keyOff[i];
+        *(uint16_t *)(ix + 2) = e[i].fmt;
+        *(uint32_t *)(ix + 4) = e[i].len;
+        *(uint32_t *)(ix + 8) = e[i].maxlen;
+        *(uint32_t *)(ix + 12) = dataOff[i];
+        strcpy((char *)(buf + keyStart + keyOff[i]), e[i].key);
+        memcpy(buf + dataStart + dataOff[i], e[i].val, e[i].len);
+    }
+    write_file(dir, "PARAM.SFO", buf, dataStart + dataSize);
+    free(buf);
+}
+
+/* ---- ScePspDateTime (16 bytes) from a Windows FILETIME ------------------------------------ */
+static void put_psp_time(uint32_t addr, const FILETIME *ft) {
+    SYSTEMTIME st;
+    memset(&st, 0, sizeof(st));
+    if (ft) { FILETIME lt; FileTimeToLocalFileTime(ft, &lt); FileTimeToSystemTime(&lt, &st); }
+    MEM_W16(addr + 0, st.wYear); MEM_W16(addr + 2, st.wMonth); MEM_W16(addr + 4, st.wDay);
+    MEM_W16(addr + 6, st.wHour); MEM_W16(addr + 8, st.wMinute); MEM_W16(addr + 10, st.wSecond);
+    MEM_W32(addr + 12, (uint32_t)st.wMilliseconds * 1000u);
+}
+
+static void wr_fixed(uint32_t addr, const char *s, int n) {
+    for (int i = 0; i < n; i++) MEM_W8(addr + (uint32_t)i, i < (int)strlen(s) ? (uint8_t)s[i] : 0);
+}
+
+/* ---- minimal PARAM.SFO reader --------------------------------------------------------------
+ * Load must hand the SFO strings BACK to the game (PPSSPP SavedataParam::LoadSFO): games keep
+ * their profile/pilot name in SAVEDATA_TITLE and read sfoParam after a load -- without this
+ * the name they saved comes back empty. */
+static void wr_guest_bytes(uint32_t addr, const uint8_t *v, uint32_t len, uint32_t cap) {
+    if (len > cap) len = cap;
+    for (uint32_t i = 0; i < len; i++) MEM_W8(addr + i, v[i]);
+    for (uint32_t i = len; i < cap; i++) MEM_W8(addr + i, 0);
+}
+
+static void load_sfo_param(uint32_t param, const char *dir) {
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s/PARAM.SFO", dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    if (n <= 20 || n > (1 << 20)) { fclose(f); return; }
+    uint8_t *b = (uint8_t *)malloc((size_t)n);
+    if (!b || fread(b, 1, (size_t)n, f) != (size_t)n) { free(b); fclose(f); return; }
+    fclose(f);
+    if (memcmp(b, "\0PSF", 4) != 0) { free(b); return; }
+    uint32_t keyStart, dataStart, cnt;
+    memcpy(&keyStart, b + 8, 4); memcpy(&dataStart, b + 12, 4); memcpy(&cnt, b + 16, 4);
+    for (uint32_t i = 0; i < cnt && 20 + 16 * (i + 1) <= (uint32_t)n; i++) {
+        const uint8_t *ix = b + 20 + 16 * i;
+        uint16_t keyOff, fmt; uint32_t len, dataOff;
+        memcpy(&keyOff, ix + 0, 2); memcpy(&fmt, ix + 2, 2);
+        memcpy(&len, ix + 4, 4); memcpy(&dataOff, ix + 12, 4);
+        if (keyStart + keyOff >= (uint32_t)n || dataStart + dataOff + len > (uint32_t)n) continue;
+        const char *key = (const char *)b + keyStart + keyOff;
+        const uint8_t *val = b + dataStart + dataOff;
+        if (fmt == 0x0204 && !strcmp(key, "TITLE"))
+            wr_guest_bytes(param + SDP_sfoTitle, val, len, 128);
+        else if (fmt == 0x0204 && !strcmp(key, "SAVEDATA_TITLE"))
+            wr_guest_bytes(param + SDP_sfoSaveTitle, val, len, 128);
+        else if (fmt == 0x0204 && !strcmp(key, "SAVEDATA_DETAIL"))
+            wr_guest_bytes(param + SDP_sfoDetail, val, len, 1024);
+        else if (fmt == 0x0404 && len >= 4 && !strcmp(key, "PARENTAL_LEVEL")) {
+            uint32_t pl; memcpy(&pl, val, 4);
+            MEM_W32(param + SDP_sfoParental, pl);
+        }
+    }
+    free(b);
+}
+
+/* ---- modes -------------------------------------------------------------------------------- */
+
+static uint32_t do_save(uint32_t param, const char *game, const char *save) {
+    char dir[MAX_PATH], fileName[16], title[129], saveTitle[129], detail[1025], saveDir[64];
+    save_dir(dir, sizeof(dir), game, save);
+    { char sd[64]; snprintf(sd, sizeof(sd), "%s%s", game, save); backup_save(dir, sd); }
+    mkdirs(dir);
+    rd_cstr(param + SDP_fileName, fileName, sizeof(fileName));
+    uint32_t dataBuf = MEM_R32(param + SDP_dataBuf);
+    uint32_t dataSize = MEM_R32(param + SDP_dataSize);
+    if (fileName[0] && dataBuf && dataSize && dataSize < 0x04000000) {
+        if (!write_file(dir, fileName, (const uint8_t *)SR_HOST(dataBuf), dataSize))
+            return 0x80110381u;   /* SAVE_NO_MS: couldn't write */
+    }
+    rd_cstr(param + SDP_sfoTitle, title, sizeof(title));
+    rd_cstr(param + SDP_sfoSaveTitle, saveTitle, sizeof(saveTitle));
+    rd_cstr(param + SDP_sfoDetail, detail, sizeof(detail));
+    snprintf(saveDir, sizeof(saveDir), "%s%s", game, save);
+    sfo_write(dir, title, saveTitle, detail, saveDir, MEM_R8(param + SDP_sfoParental), fileName);
+    write_filedata(dir, "ICON0.PNG", param + SDP_icon0);
+    write_filedata(dir, "ICON1.PMF", param + SDP_icon1);
+    write_filedata(dir, "PIC1.PNG", param + SDP_pic1);
+    write_filedata(dir, "SND0.AT3", param + SDP_snd0);
+    if (sdlog()) fprintf(stderr, "savedata: SAVE %s/%s (%u bytes)\n", dir, fileName, dataSize);
+    return 0;
+}
+
+static int dir_exists(const char *dir) {
+    DWORD a = GetFileAttributesA(dir);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+/* Read a host file into a guest PspUtilitySavedataFileData block {buf, bufSize, size, unk}.
+ * PPSSPP loads ICON0/ICON1/PIC1/SND0 back on every Load; some games require it. */
+static void load_filedata(const char *dir, const char *name, uint32_t fd) {
+    uint32_t buf = MEM_R32(fd + 0), cap = MEM_R32(fd + 4);
+    if (!buf || !cap) return;
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    size_t rd = fread(SR_HOST(buf), 1, cap, f);
+    fclose(f);
+    MEM_W32(fd + 8, (uint32_t)rd);
+}
+
+static uint32_t do_load(uint32_t param, const char *game, const char *save) {
+    char dir[MAX_PATH], fileName[16], path[MAX_PATH];
+    save_dir(dir, sizeof(dir), game, save);
+    rd_cstr(param + SDP_fileName, fileName, sizeof(fileName));
+    if (!dir_exists(dir)) {
+        if (sdlog()) fprintf(stderr, "savedata: LOAD %s -> no data\n", dir);
+        return ERR_LOAD_NO_DATA;
+    }
+    MEM_W32(param + SDP_dataSize, 0);      /* forced to zero before loading (PPSSPP) */
+    /* Blank fileName means success without reading data (PPSSPP LoadSaveData); the SFO and
+     * icon blobs are still handed back. */
+    if (fileName[0]) {
+        snprintf(path, sizeof(path), "%s/%s", dir, fileName);
+        FILE *f = fopen(path, "rb");
+        if (!f) {
+            if (sdlog()) fprintf(stderr, "savedata: LOAD %s -> file not found\n", path);
+            return ERR_LOAD_NOT_FOUND;
+        }
+        uint32_t dataBuf = MEM_R32(param + SDP_dataBuf);
+        uint32_t cap = MEM_R32(param + SDP_dataBufSize);
+        fseek(f, 0, SEEK_END);
+        long n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (n < 0) n = 0;
+        if (cap && (uint32_t)n > cap) n = (long)cap;
+        size_t rd = dataBuf ? fread(SR_HOST(dataBuf), 1, (size_t)n, f) : 0;
+        fclose(f);
+        MEM_W32(param + SDP_dataSize, (uint32_t)rd);
+        { const char *rw = getenv("SR_READWATCH");   /* debug: SR_READWATCH=<part of the file path> */
+          if (rw && dataBuf && rd && strstr(path, rw)) sr_readwatch_set(dataBuf, (uint32_t)rd); }
+        if (sdlog()) {
+            const uint8_t *p = (const uint8_t *)SR_HOST(dataBuf);
+            fprintf(stderr, "savedata: LOAD %s (%u bytes) -> buf=0x%08x cap=%u first=%02x%02x%02x%02x\n",
+                    path, (unsigned)rd, dataBuf, cap, p[0], p[1], p[2], p[3]);
+        }
+    } else if (sdlog()) {
+        fprintf(stderr, "savedata: LOAD %s (blank fileName: SFO/icons only)\n", dir);
+    }
+    /* copy the resolved save dir name back into the request (PPSSPP) */
+    wr_fixed(param + SDP_saveName, save, 20);
+    load_sfo_param(param, dir);            /* hand TITLE/SAVEDATA_TITLE/... back (LoadSFO) */
+    load_filedata(dir, "ICON0.PNG", param + SDP_icon0);
+    load_filedata(dir, "ICON1.PMF", param + SDP_icon1);
+    load_filedata(dir, "PIC1.PNG", param + SDP_pic1);
+    load_filedata(dir, "SND0.AT3", param + SDP_snd0);
+    MEM_W32(param + SDP_bind, 1021);       /* PSP always responds this; unlocks some games */
+    return 0;
+}
+
+static uint32_t do_delete(const char *game, const char *save) {
+    char dir[MAX_PATH], path[MAX_PATH];
+    save_dir(dir, sizeof(dir), game, save);
+    WIN32_FIND_DATAA fd;
+    snprintf(path, sizeof(path), "%s/*", dir);
+    HANDLE h = FindFirstFileA(path, &fd);
+    if (h == INVALID_HANDLE_VALUE) return ERR_DELETE_NO_DATA;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            snprintf(path, sizeof(path), "%s/%s", dir, fd.cFileName);
+            DeleteFileA(path);
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    RemoveDirectoryA(dir);
+    return 0;
+}
+
+/* ERASE/ERASESECURE: remove just the named data file inside the save dir (PPSSPP DeleteData). */
+static uint32_t do_erase(uint32_t param, const char *game, const char *save) {
+    char dir[MAX_PATH], fileName[16], path[MAX_PATH];
+    save_dir(dir, sizeof(dir), game, save);
+    rd_cstr(param + SDP_fileName, fileName, sizeof(fileName));
+    if (!fileName[0]) return ERR_RW_NO_DATA;
+    snprintf(path, sizeof(path), "%s/%s", dir, fileName);
+    if (sdlog()) fprintf(stderr, "savedata: ERASE %s\n", path);
+    return DeleteFileA(path) ? 0 : ERR_RW_NO_DATA;
+}
+
+/* LIST (11): fill idList with this game's save directories. */
+static uint32_t do_list(uint32_t param, const char *game) {
+    uint32_t idList = MEM_R32(param + SDP_idList);
+    if (!idList) return 0;
+    uint32_t maxCount = MEM_R32(idList + 0);
+    uint32_t entries = MEM_R32(idList + 8);
+    uint32_t count = 0;
+    char pat[MAX_PATH];
+    snprintf(pat, sizeof(pat), "%s/PSP/SAVEDATA/%s*", ms_root(), game);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        size_t gl = strlen(game);
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (fd.cFileName[0] == '.') continue;
+            if (entries && count < maxCount) {
+                uint32_t e = entries + count * 72u;       /* SceUtilitySavedataIdListEntry */
+                MEM_W32(e + 0, 0x11FF);                   /* st_mode (directory) */
+                put_psp_time(e + 4, &fd.ftCreationTime);
+                put_psp_time(e + 20, &fd.ftLastAccessTime);
+                put_psp_time(e + 36, &fd.ftLastWriteTime);
+                wr_fixed(e + 52, fd.cFileName + gl, 20);  /* saveName part only */
+            }
+            count++;
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    if (count > maxCount) count = maxCount;
+    MEM_W32(idList + 4, count);                           /* resultCount */
+    if (sdlog()) fprintf(stderr, "savedata: LIST %s* -> %u saves\n", game, count);
+    return 0;
+}
+
+static int is_system_file(const char *n) {
+    return !_stricmp(n, "PARAM.SFO") || !_stricmp(n, "ICON0.PNG") || !_stricmp(n, "ICON1.PMF") ||
+           !_stricmp(n, "PIC1.PNG") || !_stricmp(n, "SND0.AT3");
+}
+
+/* FILES (12): list the files inside one save directory. */
+static uint32_t do_files(uint32_t param, const char *game, const char *save) {
+    uint32_t fl = MEM_R32(param + SDP_fileList);
+    if (!fl) return 0;
+    uint32_t maxSec = MEM_R32(fl + 0), maxNorm = MEM_R32(fl + 4), maxSys = MEM_R32(fl + 8);
+    uint32_t pSec = MEM_R32(fl + 24), pNorm = MEM_R32(fl + 28), pSys = MEM_R32(fl + 32);
+    uint32_t nSec = 0, nNorm = 0, nSys = 0;
+    char pat[MAX_PATH], dir[MAX_PATH];
+    save_dir(dir, sizeof(dir), game, save);
+    snprintf(pat, sizeof(pat), "%s/*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        MEM_W32(fl + 12, 0); MEM_W32(fl + 16, 0); MEM_W32(fl + 20, 0);
+        return ERR_LOAD_NO_DATA;                  /* no such save: FILES_NO_DATA semantics */
+    }
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        int sys = is_system_file(fd.cFileName);
+        uint32_t *cnt = sys ? &nSys : &nNorm;
+        uint32_t base = sys ? pSys : pNorm, cap = sys ? maxSys : maxNorm;
+        for (int pass = 0; pass < (sys ? 1 : 2); pass++) {
+            if (pass == 1) { cnt = &nSec; base = pSec; cap = maxSec; }   /* data files also "secure" */
+            if (base && *cnt < cap) {
+                uint32_t e = base + *cnt * 80u;            /* SceUtilitySavedataFileListEntry */
+                MEM_W32(e + 0, 0x21FF);                    /* st_mode (file) */
+                MEM_W32(e + 4, 0);
+                MEM_W32(e + 8, fd.nFileSizeLow);
+                MEM_W32(e + 12, 0);
+                put_psp_time(e + 16, &fd.ftCreationTime);
+                put_psp_time(e + 32, &fd.ftLastAccessTime);
+                put_psp_time(e + 48, &fd.ftLastWriteTime);
+                wr_fixed(e + 64, fd.cFileName, 16);
+            }
+            (*cnt)++;
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    if (nSec > maxSec) nSec = maxSec;
+    if (nNorm > maxNorm) nNorm = maxNorm;
+    if (nSys > maxSys) nSys = maxSys;
+    MEM_W32(fl + 12, nSec); MEM_W32(fl + 16, nNorm); MEM_W32(fl + 20, nSys);
+    return 0;
+}
+
+static uint32_t do_sizes(uint32_t param, const char *game) {
+    uint32_t msFree = MEM_R32(param + SDP_msFree);
+    if (msFree) {
+        MEM_W32(msFree + 0, CLUSTER);
+        MEM_W32(msFree + 4, FREE_CLUSTERS);
+        MEM_W32(msFree + 8, FREE_CLUSTERS * (CLUSTER / 0x400));
+        wr_fixed(msFree + 12, "512 MB", 8);
+    }
+    int sizes_no_data = 0;
+    uint32_t msData = MEM_R32(param + SDP_msData);
+    if (msData) {
+        /* info block at +36: used clusters/KB of the named save (0 if absent) */
+        char game2[16], save2[24], dir[MAX_PATH], pat[MAX_PATH];
+        rd_cstr(msData + 0, game2, 14);
+        rd_cstr(msData + 16, save2, 21);
+        save_dir(dir, sizeof(dir), game2[0] ? game2 : game, save2);
+        if (dir_exists(dir)) {
+            uint64_t used = 0;
+            snprintf(pat, sizeof(pat), "%s/*", dir);
+            WIN32_FIND_DATAA fd;
+            HANDLE h = FindFirstFileA(pat, &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                do {
+                    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+                        used += ((uint64_t)fd.nFileSizeLow + CLUSTER - 1) / CLUSTER * CLUSTER;
+                } while (FindNextFileA(h, &fd));
+                FindClose(h);
+            }
+            MEM_W32(msData + 36, (uint32_t)(used / CLUSTER));
+            MEM_W32(msData + 40, (uint32_t)(used / 0x400));
+            wr_fixed(msData + 44, "", 8);
+            MEM_W32(msData + 52, (uint32_t)(used / 0x400));
+            wr_fixed(msData + 56, "", 8);
+        } else {
+            /* PPSSPP SavedataParam::GetSizes: a SIZES query for a save that does NOT exist
+             * zeroes the used-space block and returns SIZES_NO_DATA — that's how the game
+             * learns "this is a brand-new save". Our old code always returned 0 ("it exists"),
+             * so the game treated a freshly-created pilot as an overwrite of existing data and
+             * skipped registering it into a profile slot (menu stayed USER:UNKNOWN). */
+            MEM_W32(msData + 36, 0);
+            MEM_W32(msData + 40, 0);
+            wr_fixed(msData + 44, "", 8);
+            MEM_W32(msData + 52, 0);
+            wr_fixed(msData + 56, "", 8);
+            sizes_no_data = 1;
+        }
+    }
+    uint32_t ud = MEM_R32(param + SDP_usedData);
+    if (ud) {
+        uint32_t total = CLUSTER + CLUSTER;                 /* directory record + SFO */
+        if (MEM_R8(param + SDP_fileName) != 0) {
+            uint32_t ds = MEM_R32(param + SDP_dataSize);
+            total += ((ds + CLUSTER - 1) / CLUSTER) * CLUSTER;
+        }
+        uint32_t sizes[4] = { MEM_R32(param + SDP_icon0 + 8), MEM_R32(param + SDP_icon1 + 8),
+                              MEM_R32(param + SDP_pic1 + 8), MEM_R32(param + SDP_snd0 + 8) };
+        for (int i = 0; i < 4; i++) total += ((sizes[i] + CLUSTER - 1) / CLUSTER) * CLUSTER;
+        MEM_W32(ud + 0, total / CLUSTER);
+        MEM_W32(ud + 4, total / 0x400);
+        wr_fixed(ud + 8, "", 8);
+        MEM_W32(ud + 16, total / 0x400);
+        wr_fixed(ud + 20, "", 8);
+    }
+    return sizes_no_data ? ERR_SIZES_NO_DATA : 0;
+}
+
+/* GETSIZE (22): free space, and the space still missing for the listed files (PPSSPP
+ * SavedataParam::GetSize). neededKB/overwriteKB are the SHORTFALL: 0 when the files fit. The old
+ * code put the files' whole size there, so the Data Install screen (214 MB of files) always
+ * reported "Not enough free space". Returns RW_NO_DATA when the save directory does not exist. */
+static uint64_t file_size_in(const char *dir, const char *name) {
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!name[0] || !GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) return 0;
+    return ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+}
+static uint32_t do_getsize(uint32_t param, const char *game, const char *save) {
+    char dir[MAX_PATH];
+    save_dir(dir, sizeof(dir), game, save);
+    const int exists = dir_exists(dir);
+    const uint32_t si = MEM_R32(param + SDP_sizeInfo);
+    if (si) {
+        const uint32_t nSec = MEM_R32(si + 0), nNorm = MEM_R32(si + 4);
+        const uint32_t pSec = MEM_R32(si + 8), pNorm = MEM_R32(si + 12);
+        const uint64_t free_bytes = (uint64_t)FREE_CLUSTERS * CLUSTER;
+        int64_t write = 0, overwrite = 0;
+        for (int sec = 0; sec < 2; sec++) {
+            const uint32_t n = sec ? nSec : nNorm, base = sec ? pSec : pNorm;
+            for (uint32_t i = 0; base && i < n && i < 256; i++) {
+                const uint32_t e = base + i * 24u;
+                char name[17];
+                rd_cstr(e + 8, name, sizeof(name));
+                write += (int64_t)(MEM_R32(e) | ((uint64_t)MEM_R32(e + 4) << 32)) + (sec ? 0x10 : 0);
+                if (exists) overwrite += (int64_t)file_size_in(dir, name);
+            }
+        }
+        MEM_W32(si + 16, CLUSTER);                              /* sectorSize */
+        MEM_W32(si + 20, (uint32_t)(free_bytes / CLUSTER));     /* freeSectors */
+        MEM_W32(si + 24, (uint32_t)(free_bytes / 0x400));       /* freeKB */
+        wr_fixed(si + 28, "512 MB", 8);
+        if (write - overwrite < (int64_t)free_bytes) {
+            MEM_W32(si + 36, 0);                                /* neededKB */
+            MEM_W32(si + 48, 0);                                /* overwriteKB */
+        } else {
+            const int64_t need = write - (int64_t)free_bytes, need_ow = need - overwrite;
+            MEM_W32(si + 36, (uint32_t)((need + 1023) / 1024));
+            MEM_W32(si + 48, (uint32_t)(need_ow > 0 ? (need_ow + 1023) / 1024 : 0));
+        }
+    }
+    return exists ? 0 : ERR_RW_NO_DATA;
+}
+
+/* Resolve the effective saveName (PPSSPP GetSaveDirName): "<>" is a wildcard meaning "any
+ * existing save"; the LIST modes carry a saveNameList the user would normally pick from in
+ * the system UI -- headless, auto-select the first entry whose directory exists (falling
+ * back to the first entry for a fresh LISTSAVE). */
+static void resolve_save(uint32_t param, uint32_t mode, const char *game, char *save, int cap) {
+    rd_cstr(param + SDP_saveName, save, cap);
+    int wild = !strcmp(save, "<>");
+    int isList = (mode == SD_LISTLOAD || mode == SD_LISTSAVE || mode == SD_LISTDELETE);
+    uint32_t list = MEM_R32(param + SDP_saveNameList);
+    if ((isList || wild) && list) {
+        char ent[24], first[24] = "", dir[MAX_PATH];
+        for (int i = 0; i < 99; i++) {
+            rd_cstr(list + (uint32_t)i * 20, ent, 21);
+            if (!ent[0]) break;
+            if (!strcmp(ent, "<>")) continue;
+            if (!first[0]) snprintf(first, sizeof(first), "%s", ent);
+            save_dir(dir, sizeof(dir), game, ent);
+            if (dir_exists(dir)) { snprintf(save, (size_t)cap, "%s", ent); return; }
+        }
+        if (mode == SD_LISTSAVE && first[0]) { snprintf(save, (size_t)cap, "%s", first); return; }
+    }
+    if (wild) {
+        /* no list (or none existed): first existing dir matching <game>* */
+        char pat[MAX_PATH];
+        WIN32_FIND_DATAA fd;
+        snprintf(pat, sizeof(pat), "%s/PSP/SAVEDATA/%s*", ms_root(), game);
+        HANDLE h = FindFirstFileA(pat, &fd);
+        save[0] = 0;
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                    /* only real saves: the Data Install folder (ULUS10567DATA) has no PARAM.SFO */
+                    char sfo[MAX_PATH];
+                    snprintf(sfo, sizeof(sfo), "%s/PSP/SAVEDATA/%s/PARAM.SFO", ms_root(), fd.cFileName);
+                    if (GetFileAttributesA(sfo) == INVALID_FILE_ATTRIBUTES) continue;
+                    snprintf(save, (size_t)cap, "%s", fd.cFileName + strlen(game));
+                    break;
+                }
+            } while (FindNextFileA(h, &fd));
+            FindClose(h);
+        }
+    }
+}
+
+/* A string value from a save's PARAM.SFO (SAVEDATA_TITLE, SAVEDATA_DETAIL, ...). */
+static int sfo_get(const char *dir, const char *key, char *out, int cap) {
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s/PARAM.SFO", dir);
+    out[0] = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    uint8_t b[8192]; size_t n = fread(b, 1, sizeof(b), f); fclose(f);
+    if (n < 20 || memcmp(b, "\0PSF", 4)) return 0;
+    const uint32_t kt = b[8] | b[9] << 8 | b[10] << 16 | (uint32_t)b[11] << 24;
+    const uint32_t dt = b[12] | b[13] << 8 | b[14] << 16 | (uint32_t)b[15] << 24;
+    const uint32_t cnt = b[16] | b[17] << 8 | b[18] << 16 | (uint32_t)b[19] << 24;
+    for (uint32_t i = 0; i < cnt && 20 + i * 16 + 16 <= n; i++) {
+        const uint8_t *e = b + 20 + i * 16;
+        const uint32_t ko = kt + (e[0] | e[1] << 8), len = e[4] | e[5] << 8 | e[6] << 16 | (uint32_t)e[7] << 24;
+        const uint32_t dof = dt + (e[12] | e[13] << 8 | e[14] << 16 | (uint32_t)e[15] << 24);
+        if (ko >= n || dof >= n || strcmp((const char *)b + ko, key)) continue;
+        int m = (int)len < cap - 1 ? (int)len : cap - 1;
+        if (dof + (uint32_t)m > n) m = (int)(n - dof);
+        memcpy(out, b + dof, (size_t)m); out[m] = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* The PSP system save/load screen for the LIST modes: the player picks a slot from the game's
+ * saveNameList (load/delete: slots with data; save: all, empty ones as "New Data") and confirms
+ * an overwrite or delete. Returns 0 = picked (save[] set), 1 = cancelled, -1 = not shown
+ * (headless, SR_SAVEDLG=0, or no list): the caller keeps the automatic choice. */
+static int pick_save(uint32_t param, uint32_t mode, const char *game, char *save, int cap) {
+    const char *sd = getenv("SR_SAVEDLG");
+    if (sd && sd[0] == '0') return -1;
+    const uint32_t list = MEM_R32(param + SDP_saveNameList);
+    if (!list) return -1;
+    enum { MAXE = 48 };
+    static char name[MAXE][24], item[MAXE][96], det[MAXE][600];
+    const char *items[MAXE], *dets[MAXE];
+    FILETIME ft[MAXE];
+    int n = 0, best = -1;
+    char cur[24]; rd_cstr(param + SDP_saveName, cur, sizeof(cur));
+    for (int i = 0; i < 99 && n < MAXE; i++) {
+        char ent[24], dir[MAX_PATH];
+        rd_cstr(list + (uint32_t)i * 20, ent, 21);
+        if (!ent[0]) break;
+        if (!strcmp(ent, "<>")) continue;
+        save_dir(dir, sizeof(dir), game, ent);
+        const int has = dir_exists(dir);
+        if (!has && mode != SD_LISTSAVE) continue;
+        char slot[32];
+        if (!strncmp(ent, "DATA", 4) && ent[4] >= '0' && ent[4] <= '9') snprintf(slot, sizeof(slot), "Slot %d", atoi(ent + 4) + 1);
+        else snprintf(slot, sizeof(slot), "%s", ent);
+        snprintf(name[n], sizeof(name[n]), "%s", ent);
+        det[n][0] = 0;
+        memset(&ft[n], 0, sizeof(ft[n]));
+        if (has) {
+            char t[128] = "", when[32] = "", path[MAX_PATH];
+            sfo_get(dir, "SAVEDATA_TITLE", t, sizeof(t));
+            sfo_get(dir, "SAVEDATA_DETAIL", det[n], sizeof(det[n]));
+            snprintf(path, sizeof(path), "%s/PARAM.SFO", dir);
+            WIN32_FILE_ATTRIBUTE_DATA fa;
+            if (GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) {
+                FILETIME lt; SYSTEMTIME st;
+                ft[n] = fa.ftLastWriteTime;
+                FileTimeToLocalFileTime(&fa.ftLastWriteTime, &lt); FileTimeToSystemTime(&lt, &st);
+                snprintf(when, sizeof(when), "%04u/%02u/%02u  %02u:%02u", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
+            }
+            snprintf(item[n], sizeof(item[n]), "%s     %s     %s", slot, t[0] ? t : "Saved data", when);
+            if (mode == SD_LISTSAVE ? !strcmp(ent, cur)
+                                    : (best < 0 || CompareFileTime(&ft[n], &ft[best]) > 0)) best = n;
+        } else {
+            snprintf(item[n], sizeof(item[n]), "%s     New Data", slot);
+        }
+        items[n] = item[n]; dets[n] = det[n];
+        n++;
+    }
+    if (n == 0 && (mode == SD_LISTLOAD || mode == SD_LISTDELETE)) {
+        /* Nothing to load: the PSP (and PPSSPP) say so and go back. Returning "no data" at once
+         * made the game restart from the logos with no message (issue #16: system data saved,
+         * no game save yet). */
+        const char *none[1] = { "There is no saved data." };
+        int s0 = 0;
+        if (gui_dialog(mode == SD_LISTDELETE ? "Delete" : "Load", none, 1, NULL, &s0, "Any button: back") < 0) return -1;
+        return 1;                                    /* as if cancelled: back to the menu */
+    }
+    if (n == 0) return -1;
+    int sel = best >= 0 ? best : 0;
+    const char *title = mode == SD_LISTSAVE ? "Save" : mode == SD_LISTDELETE ? "Delete" : "Load";
+    for (;;) {
+        const int r = gui_dialog(title, items, n, dets, &sel, "X / Enter: select     Z / Backspace: back");
+        if (r < 0) return -1;
+        if (r == 0) return 1;
+        char sdir[MAX_PATH];
+        save_dir(sdir, sizeof(sdir), game, name[sel]);
+        if ((mode == SD_LISTSAVE && dir_exists(sdir)) || mode == SD_LISTDELETE) {
+            const char *yn[2] = { "No", "Yes" };
+            int c = 0;
+            const int q = gui_dialog(mode == SD_LISTDELETE ? "Delete this saved data?" : "Overwrite this saved data?",
+                                     yn, 2, NULL, &c, NULL);
+            if (q < 0) return -1;
+            if (q == 0 || c != 1) continue;          /* back to the list */
+        }
+        snprintf(save, (size_t)cap, "%s", name[sel]);
+        return 0;
+    }
+}
+
+int g_savedata_loads = 0;                  /* game saves (not system data) loaded */
+uint32_t sr_savedata_execute(uint32_t param) {
+    if (!param) return 0;
+    uint32_t mode = MEM_R32(param + SDP_mode);
+    char game[16], save[24];
+    rd_cstr(param + SDP_gameName, game, 14);
+    if (mode == SD_LISTLOAD || mode == SD_LISTSAVE || mode == SD_LISTDELETE) {
+        const int r = pick_save(param, mode, game, save, 21);
+        if (r == 1) {
+            if (sdlog()) fprintf(stderr, "savedata: mode=%u cancelled in the dialog\n", mode);
+            return 1;                      /* SCE_UTILITY_DIALOG_RESULT_CANCEL */
+        }
+        if (r < 0) resolve_save(param, mode, game, save, 21);
+        else wr_fixed(param + SDP_saveName, save, 20);
+    } else resolve_save(param, mode, game, save, 21);
+    if (sdlog()) fprintf(stderr, "savedata: mode=%u game='%s' save='%s'\n", mode, game, save);
+    switch (mode) {
+        case SD_AUTOSAVE: case SD_SAVE: case SD_LISTSAVE:
+        case SD_MAKEDATA: case SD_MAKEDATASECURE:
+        case SD_WRITEDATA: case SD_WRITEDATASECURE: {
+            uint32_t r = do_save(param, game, save);
+            /* The PSP shows its own "saving / save complete" UI; ours writes instantly and
+             * silently, so tell the player. System data (settings) saves stay quiet. */
+            if (!strstr(save, "SYS")) {
+                char msg[64];
+                if (r) snprintf(msg, sizeof(msg), "Save failed");
+                else if (!strncmp(save, "DATA", 4) && save[4]) snprintf(msg, sizeof(msg), "Game saved  (slot %d)", atoi(save + 4) + 1);
+                else snprintf(msg, sizeof(msg), "Game saved");
+                gui_toast(msg);
+            }
+            /* PPSSPP: MAKEDATA reports a full stick with the RW error code */
+            if (r == 0x80110381u && (mode == SD_MAKEDATA || mode == SD_MAKEDATASECURE))
+                r = ERR_RW_MS_FULL;
+            return r;
+        }
+        case SD_AUTOLOAD: case SD_LOAD: case SD_LISTLOAD: {
+            uint32_t r = do_load(param, game, save);
+            if (r == 0 && !strstr(save, "SYS")) g_savedata_loads++;   /* test scripts (SR_PADSTOP_LOAD) */
+            return r;
+        }
+        case SD_READDATA: case SD_READDATASECURE: {
+            uint32_t r = do_load(param, game, save);             /* PPSSPP error remap */
+            if (r == 0 && !strstr(save, "SYS")) g_savedata_loads++;
+            if (r == ERR_LOAD_NO_DATA) r = ERR_RW_NO_DATA;
+            if (r == ERR_LOAD_NOT_FOUND) r = ERR_RW_NOT_FOUND;
+            return r;
+        }
+        case SD_LISTDELETE: case SD_DELETE: case SD_AUTODELETE:
+            return do_delete(game, save);
+        case SD_DELETEDATA: {
+            uint32_t r = do_delete(game, save);
+            return r == ERR_DELETE_NO_DATA ? ERR_RW_NO_DATA : r;
+        }
+        case SD_ERASE: case SD_ERASESECURE:
+            return do_erase(param, game, save);
+        case SD_LIST:
+            return do_list(param, game);
+        case SD_FILES:
+            return do_files(param, game, save);
+        case SD_SIZES:
+            return do_sizes(param, game);
+        case SD_GETSIZE:
+            return do_getsize(param, game, save);
+        default:
+            if (sdlog()) fprintf(stderr, "savedata: UNHANDLED mode=%u\n", mode);
+            return 0;
+    }
+}

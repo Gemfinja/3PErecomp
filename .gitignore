@@ -1,0 +1,60 @@
+# Game data — never commit anything owned by Square Enix
+*.iso
+*.cso
+*.pkg
+*.fsd
+*.BIN
+*.bin
+*.elf
+*.prx
+*.PRX
+*.AT3
+*.pmf
+extracted/
+dumps/
+
+# Recompiler output is derived from game code: regenerate, never commit
+generated/
+
+# Build output
+build/
+out/
+*.exe
+*.pdb
+
+# Ghidra project binaries (export names/types to text instead)
+ghidra/*.rep/
+ghidra/*.gpr
+ghidra/*.lock*
+
+# Portable PPSSPP install (reference emulator)
+ppsspp/
+# PPSSPP currently sits in the repo root: ignore its files until it moves to ppsspp/
+/assets/
+/memstick/
+/README.md
+
+# PPSSPP save states / logs
+*.ppst
+logs/
+
+__pycache__/
+
+# Framework bake-off checkouts
+bakeoff/
+
+# Local toolchains (MSYS2 etc.)
+/Vs assets/
+
+# Packaged builds (contain code derived from the game)
+dist/
+
+# Unlock-all system data (unlocks/README.md) is shipped on purpose
+!unlocks/ULUS10567SYSDATA/*.BIN
+
+# Android build artifacts
+android/app/build/
+android/app/.cxx/
+android/.gradle/
+android/local.properties
+*.apk

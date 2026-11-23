@@ -1,0 +1,900 @@
+/* Interactive front-end: a real window that shows the game's framebuffer and feeds the keyboard
+ * to sceCtrl, so the recompiled game runs like a normal app (watch the intro, press START, play).
+ *
+ * Win32/GDI only (no external deps): a top-level window, a 32-bit DIB the PSP 16/32-bit
+ * framebuffer is converted into each frame, and GetAsyncKeyState mapped to the PSP pad. The game
+ * loop drives presentation: sceDisplaySetFrameBuf calls gui_present(), which also pumps the window
+ * message queue and samples the keyboard. */
+
+#define _CRT_SECURE_NO_WARNINGS
+#include "recomp.h"
+#include "game_addrs.h"
+#ifdef SR_SDL3VK
+#include "gpu_sdl3vk/sdl3vk.h"
+#include "gpu_sdl3vk/ge_gpu.h"
+#endif
+#ifdef _WIN32
+#include <windows.h>
+#define DIRECTINPUT_VERSION 0x0800
+#include <dinput.h>
+#else
+#include "posix_compat.h"
+#endif
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+/* Left stick setting id: kept out of recomp.h, which is part of the kit (a change there would
+ * make every player prepare the game again). */
+#ifndef SR_TS_ANALOG_MOVE
+#define SR_TS_ANALOG_MOVE (SR_TS_FREE_AIM + 1)
+#endif
+
+#define PSP_W 480
+#define PSP_H 272
+
+static int      s_on = 0;
+static int      s_sdl3 = 0;            /* SDL3+Vulkan presenter active (src/rt/gpu_sdl3vk) */
+static uint32_t *s_px;                 /* PSP_W*PSP_H BGRA for StretchDIBits */
+static uint32_t s_buttons = 0;
+static uint8_t s_lx = 128, s_ly = 128;     /* live left-stick, latched each present */
+static float s_rx = 0.0f, s_ry = 0.0f;     /* live right stick (-1..1), latched each present */
+static int s_pad_present = 0;               /* a controller is currently connected */
+static LARGE_INTEGER s_freq, s_last;   /* frame pacing to ~60 Hz */
+#ifdef _WIN32
+static HWND     s_hwnd;
+static BITMAPINFO s_bmi;
+
+/* PSP button bits (sceCtrl): SELECT 0x1, START 0x8, UP 0x10, RIGHT 0x20, DOWN 0x40, LEFT 0x80,
+ * LTRIG 0x100, RTRIG 0x200, TRIANGLE 0x1000, CIRCLE 0x2000, CROSS 0x4000, SQUARE 0x8000. */
+static uint32_t read_keys(void) {
+    uint32_t b = 0;
+    #define K(vk,bit) do { if (GetAsyncKeyState(vk) & 0x8000) b |= (bit); } while (0)
+    K(VK_RETURN, 0x0008);              /* Enter  -> START  */
+    K(VK_RSHIFT, 0x0001); K(VK_LSHIFT, 0x0001); /* Shift -> SELECT */
+    K('X', 0x4000);                    /* X -> CROSS   (confirm) */
+    K('Z', 0x2000);                    /* Z -> CIRCLE  (back)    */
+    K('A', 0x8000);                    /* A -> SQUARE  */
+    K('S', 0x1000);                    /* S -> TRIANGLE */
+    K('Q', 0x0100);                    /* Q -> L */
+    K('W', 0x0200);                    /* W -> R */
+    K(VK_UP, 0x0010); K(VK_DOWN, 0x0040); K(VK_LEFT, 0x0080); K(VK_RIGHT, 0x0020);
+    #undef K
+    return b;
+}
+
+/* ---- Gamepad support (XInput + DirectInput) ---------------------------------------------------
+ * Generic controller support without external deps. XInput (loaded dynamically) covers Xbox pads
+ * and the many third-party / PS-style pads that present an XInput interface (incl. PS4 via Steam
+ * Input or DS4Windows). DirectInput covers a DualShock 4 / generic HID gamepad connected directly.
+ * Both feed the same PSP pad mask plus the analog left stick (Lx/Ly, 0..255, 128=centre). */
+/* XInput (dynamically loaded so we don't hard-depend on a specific xinput*.dll at link time). */
+typedef struct { WORD wButtons; BYTE bLeftTrigger, bRightTrigger; SHORT sThumbLX, sThumbLY, sThumbRX, sThumbRY; } XIGAMEPAD;
+typedef struct { DWORD dwPacketNumber; XIGAMEPAD Gamepad; } XISTATE;
+typedef DWORD (WINAPI *PFN_XInputGetState)(DWORD, XISTATE *);
+static PFN_XInputGetState s_xiGetState;
+
+static IDirectInput8A     *s_di;
+static IDirectInputDevice8A *s_dijoy;
+
+static BOOL CALLBACK di_enum_cb(const DIDEVICEINSTANCEA *inst, void *ctx) {
+    (void)ctx;
+    if (FAILED(IDirectInput8_CreateDevice(s_di, &inst->guidInstance, &s_dijoy, NULL)))
+        return DIENUM_CONTINUE;
+    return DIENUM_STOP;   /* take the first attached game controller */
+}
+
+static void pad_init(void) {
+    const char *dll[3] = { "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll" };
+    for (int i = 0; i < 3 && !s_xiGetState; i++) {
+        HMODULE h = LoadLibraryA(dll[i]);
+        if (h) s_xiGetState = (PFN_XInputGetState)(void *)GetProcAddress(h, "XInputGetState");
+    }
+    if (SUCCEEDED(DirectInput8Create(GetModuleHandleA(0), DIRECTINPUT_VERSION, &IID_IDirectInput8A,
+                                     (void **)&s_di, NULL))) {
+        IDirectInput8_EnumDevices(s_di, DI8DEVCLASS_GAMECTRL, di_enum_cb, NULL, DIEDFL_ATTACHEDONLY);
+        if (s_dijoy) {
+            IDirectInputDevice8_SetDataFormat(s_dijoy, &c_dfDIJoystick2);
+            IDirectInputDevice8_SetCooperativeLevel(s_dijoy, s_hwnd, DISCL_BACKGROUND | DISCL_NONEXCLUSIVE);
+            /* Normalise the main axes to 0..65535 so centre is ~32767. */
+            for (int axis = 0; axis < 2; axis++) {
+                DIPROPRANGE pr; pr.diph.dwSize = sizeof(pr); pr.diph.dwHeaderSize = sizeof(pr.diph);
+                pr.diph.dwObj = (DWORD)(axis == 0 ? DIJOFS_X : DIJOFS_Y); pr.diph.dwHow = DIPH_BYOFFSET;
+                pr.lMin = 0; pr.lMax = 65535;
+                IDirectInputDevice8_SetProperty(s_dijoy, DIPROP_RANGE, &pr.diph);
+            }
+            IDirectInputDevice8_Acquire(s_dijoy);
+        }
+    }
+    fprintf(stderr, "pad_init: XInput=%s DirectInput=%s\n",
+            s_xiGetState ? "ok" : "none", s_dijoy ? "ok" : "none");
+}
+
+static uint8_t axis_to_psp(int centred /* -32768..32767 */, int deadzone) {
+    if (centred > -deadzone && centred < deadzone) return 128;
+    int u = (centred + 32768) * 255 / 65535;
+    return (uint8_t)(u < 0 ? 0 : u > 255 ? 255 : u);
+}
+
+/* Poll connected pads. Returns the PSP button mask and (via lx/ly) the analog left stick. */
+static uint32_t read_pad(uint8_t *lx, uint8_t *ly) {
+    uint32_t b = 0; int have_stick = 0; int present = 0;
+    if (s_xiGetState) {
+        XISTATE st;
+        if (s_xiGetState(0, &st) == 0 /* ERROR_SUCCESS */) {
+            present = 1;
+            WORD w = st.Gamepad.wButtons;
+            if (w & 0x1000) b |= 0x4000;   /* A -> CROSS    */
+            if (w & 0x2000) b |= 0x2000;   /* B -> CIRCLE   */
+            if (w & 0x4000) b |= 0x8000;   /* X -> SQUARE   */
+            if (w & 0x8000) b |= 0x1000;   /* Y -> TRIANGLE */
+            if (w & 0x0010) b |= 0x0008;   /* Start -> START  */
+            if (w & 0x0020) b |= 0x0001;   /* Back  -> SELECT */
+            if (w & 0x0100) b |= 0x0100;   /* LB -> L */
+            if (w & 0x0200) b |= 0x0200;   /* RB -> R */
+            if (st.Gamepad.bLeftTrigger  > 64) b |= 0x0100;
+            if (st.Gamepad.bRightTrigger > 64) b |= 0x0200;
+            if (w & 0x0001) b |= 0x0010;   /* DPad up    */
+            if (w & 0x0002) b |= 0x0040;   /* DPad down  */
+            if (w & 0x0004) b |= 0x0080;   /* DPad left  */
+            if (w & 0x0008) b |= 0x0020;   /* DPad right */
+            *lx = axis_to_psp(st.Gamepad.sThumbLX, 7849);
+            *ly = axis_to_psp(-st.Gamepad.sThumbLY, 7849);   /* PSP Y: up=0, down=255 */
+            have_stick = 1;
+        }
+    }
+    if (s_dijoy) {
+        DIJOYSTATE2 js;
+        HRESULT hr = IDirectInputDevice8_Poll(s_dijoy);
+        if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED) IDirectInputDevice8_Acquire(s_dijoy);
+        if (SUCCEEDED(IDirectInputDevice8_GetDeviceState(s_dijoy, sizeof(js), &js))) {
+            present = 1;
+            const unsigned char *bt = js.rgbButtons;     /* DualShock4 / generic HID order */
+            if (bt[1] & 0x80) b |= 0x4000;   /* Cross    -> CROSS    */
+            if (bt[2] & 0x80) b |= 0x2000;   /* Circle   -> CIRCLE   */
+            if (bt[0] & 0x80) b |= 0x8000;   /* Square   -> SQUARE   */
+            if (bt[3] & 0x80) b |= 0x1000;   /* Triangle -> TRIANGLE */
+            if (bt[4] & 0x80) b |= 0x0100;   /* L1 -> L */
+            if (bt[5] & 0x80) b |= 0x0200;   /* R1 -> R */
+            if (bt[6] & 0x80) b |= 0x0100;   /* L2 -> L */
+            if (bt[7] & 0x80) b |= 0x0200;   /* R2 -> R */
+            if (bt[8] & 0x80) b |= 0x0001;   /* Share/Select -> SELECT */
+            if (bt[9] & 0x80) b |= 0x0008;   /* Options/Start -> START */
+            DWORD pov = js.rgdwPOV[0];
+            if ((pov & 0xFFFF) != 0xFFFF) {  /* hat: centidegrees, 0=up clockwise */
+                if (pov > 27000 || pov < 9000)  b |= 0x0010;   /* up    */
+                if (pov > 9000  && pov < 27000) b |= 0x0040;   /* down  */
+                if (pov > 18000)                 b |= 0x0080;   /* left  */
+                if (pov > 0 && pov < 18000)      b |= 0x0020;   /* right */
+            }
+            if (!have_stick) {               /* prefer XInput stick if both present */
+                *lx = axis_to_psp((int)js.lX - 32768, 6000);
+                *ly = axis_to_psp((int)js.lY - 32768, 6000);
+            }
+        }
+    }
+    s_pad_present = present;
+    return b;
+}
+
+static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_CLOSE || m == WM_DESTROY) { PostQuitMessage(0); return 0; }
+    if (m == WM_KEYDOWN && w == VK_ESCAPE) { PostQuitMessage(0); return 0; }
+    return DefWindowProc(h, m, w, l);
+}
+#endif
+
+void gui_init(const char *title) {
+#ifdef SR_SDL3VK
+    /* SDL3+Vulkan presenter (src/rt/gpu_sdl3vk, Phase 0): default in this build;
+     * SR_VIDEO=gdi falls back to the classic Win32/GDI window below. */
+    {
+        const char *v = getenv("SR_VIDEO");
+        if (!v || strcmp(v, "gdi") != 0) {
+            if (sdl3vk_init(title)) {
+                s_sdl3 = 1;
+                { extern void sr_update_check_start(void); sr_update_check_start(); }
+                s_px = (uint32_t *)malloc(PSP_W * PSP_H * 4);
+                QueryPerformanceFrequency(&s_freq);
+                QueryPerformanceCounter(&s_last);
+                s_on = 1;
+                if (getenv("SR_TOAST_TEST")) sdl3vk_toast(getenv("SR_TOAST_TEST"), 60000);
+                /* GPU rasterizer: captures GE triangles/sprites and renders them with Vulkan.
+                 * On by default; SR_GPU_GE=0 selects the software rasterizer in ge.c, which
+                 * costs ~17 ms of host time per frame in this game and halves movie speed. */
+                {
+                    const char *gge = getenv("SR_GPU_GE");
+                    if (!gge || !gge[0] || strcmp(gge, "0") != 0) {
+                        if (!gegpu_init())
+                            fprintf(stderr, "gui_init: GPU GE init failed; software GE active\n");
+                    }
+                }
+                return;
+            }
+            fprintf(stderr, "gui_init: SDL3/Vulkan init failed; falling back to GDI\n");
+        }
+    }
+#endif
+#ifdef _WIN32
+    WNDCLASSA wc = {0};
+    wc.lpfnWndProc = wndproc;
+    wc.hInstance = GetModuleHandleA(0);
+    wc.lpszClassName = "psp_recomp";
+    wc.hCursor = LoadCursor(0, IDC_ARROW);
+    RegisterClassA(&wc);
+    RECT r = {0, 0, PSP_W * 2, PSP_H * 2};
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    s_hwnd = CreateWindowA("psp_recomp", title ? title : "PSP Recomp",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
+        r.right - r.left, r.bottom - r.top, 0, 0, GetModuleHandleA(0), 0);
+    s_px = (uint32_t *)malloc(PSP_W * PSP_H * 4);
+    s_bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    s_bmi.bmiHeader.biWidth = PSP_W;
+    s_bmi.bmiHeader.biHeight = -PSP_H;          /* top-down */
+    s_bmi.bmiHeader.biPlanes = 1;
+    s_bmi.bmiHeader.biBitCount = 32;
+    s_bmi.bmiHeader.biCompression = BI_RGB;
+    QueryPerformanceFrequency(&s_freq);
+    QueryPerformanceCounter(&s_last);
+    s_on = 1;
+    pad_init();                            /* XInput / DirectInput controllers */
+#endif
+}
+
+int gui_on(void) { return s_on; }
+uint32_t gui_buttons(void) { return s_buttons; }
+void gui_analog(uint8_t *lx, uint8_t *ly) { if (lx) *lx = s_lx; if (ly) *ly = s_ly; }
+void gui_rstick(float *rx, float *ry) { if (rx) *rx = s_rx; if (ry) *ry = s_ry; }
+void gui_mouse_look(float *yaw, float *pitch) {
+    *yaw = *pitch = 0.0f;
+#ifdef SR_SDL3VK
+    if (s_sdl3) sdl3vk_mouse_look(yaw, pitch);
+#endif
+}
+void gui_toast(const char *msg) {
+    fprintf(stderr, "toast: %s\n", msg);
+#ifdef SR_SDL3VK
+    if (s_sdl3) sdl3vk_toast(msg, 3000);
+#endif
+}
+int gui_cfg_get(const char *key, int def) {
+#ifdef SR_SDL3VK
+    if (s_sdl3) return sdl3vk_cfg_get(key, def);
+#endif
+    return def;
+}
+int gui_cam_reset(void) {
+#ifdef SR_SDL3VK
+    if (s_sdl3) return sdl3vk_cam_reset();
+#endif
+    return 0;
+}
+int gui_sens_steps(void) {
+#ifdef SR_SDL3VK
+    if (s_sdl3) return sdl3vk_sens_steps();
+#endif
+    return 0;
+}
+int gui_pad_present(void) { return s_pad_present; }
+
+/* Present a framebuffer at guest address fbaddr. fmt: 0=5650, 1=5551, 2=4444, 3=8888.
+ * stride is in pixels (PSP buffer width, typically 512). */
+/* Convert the guest framebuffer to the BGRA words both presenters consume. */
+static void convert_fb(uint32_t fbaddr, int fmt, uint32_t stride) {
+    for (int y = 0; y < PSP_H; y++) {
+        for (int x = 0; x < PSP_W; x++) {
+            uint32_t i = (uint32_t)(y * (int)stride + x);
+            int rr, gg, bb;
+            if (fmt == 3) {
+                uint32_t p = sr_r32(fbaddr + i * 4);
+                rr = p & 0xFF; gg = (p >> 8) & 0xFF; bb = (p >> 16) & 0xFF;
+            } else {
+                uint16_t p = sr_r16(fbaddr + i * 2);
+                if (fmt == 1) {            /* 5551 */
+                    rr = (p & 0x1F) << 3; gg = ((p >> 5) & 0x1F) << 3; bb = ((p >> 10) & 0x1F) << 3;
+                } else if (fmt == 2) {     /* 4444 */
+                    rr = (p & 0xF) << 4; gg = ((p >> 4) & 0xF) << 4; bb = ((p >> 8) & 0xF) << 4;
+                } else {                   /* 5650 */
+                    rr = (p & 0x1F) << 3; gg = ((p >> 5) & 0x3F) << 2; bb = ((p >> 11) & 0x1F) << 3;
+                }
+            }
+            s_px[y * PSP_W + x] = ((uint32_t)rr << 16) | ((uint32_t)gg << 8) | (uint32_t)bb;
+        }
+    }
+}
+
+#ifdef SR_SDL3VK
+/* ---- frame interpolation presentation (see gui_present) ---------------------------------- */
+static int      s_fi_phase = 0;         /* 1: in-between frame due, 2: the held real frame due */
+static void    *s_fi_img = NULL;
+static uint32_t s_fi_fb = 0, s_fi_stride = 0;
+static int      s_fi_fmt = 0;
+
+static void fi_show_held(void) {
+    int shown = 1;
+    if (s_fi_phase == 1) shown = gegpu_present_interp(s_fi_img);
+    if (shown != 0) {
+        shown = gegpu_present(s_fi_fb, s_fi_fmt, s_fi_stride);
+        if (shown < 0) { convert_fb(s_fi_fb, s_fi_fmt, s_fi_stride); shown = sdl3vk_present_rgba(s_px); }
+    }
+    s_fi_phase = 0;
+    if (shown == 0) { sdl3vk_shutdown(); _Exit(0); }
+}
+#endif
+
+/* Called by the scheduler on every vblank. */
+#ifdef __ANDROID__
+static void gui_vblank_impl(void);
+static void gui_vblank_tramp(void *p) { (void)p; gui_vblank_impl(); }
+void gui_vblank(void) {
+    extern void sched_run_on_main_stack(void (*fn)(void *), void *arg);
+    sched_run_on_main_stack(gui_vblank_tramp, NULL);
+}
+static void gui_vblank_impl(void) {
+#else
+void gui_vblank(void) {
+#endif
+    { extern void sr_mods_vblank(void); sr_mods_vblank(); }   /* data mods: memory patches */
+    { extern void sr_cheats_vblank(void); sr_cheats_vblank(); }   /* Esc menu > Cheats */
+#ifdef SR_SDL3VK
+    if (!s_sdl3 || !s_fi_phase) return;
+    { extern int sched_fast_forward(void); if (sched_fast_forward()) { s_fi_phase = 0; return; } }
+    /* SR_FI_SHOT=n: save the real frame before the n-th in-between frame, that frame and the
+     * real frame after it as screenshots (checking the interpolation) */
+    {
+        static long at = -2, n = 0;
+        static int on_move = 0;
+        if (at == -2) {
+            const char *e = getenv("SR_FI_SHOT");
+            at = e ? atol(e) : -1;
+            on_move = e && !strcmp(e, "move");     /* SR_FI_SHOT=move: while Aya walks */
+        }
+        if (on_move && at == 0 && sr_twinstick_setting(SR_TS_MOVING) != 0.0f && s_fi_phase == 2) {
+            static int seen = 0;
+            if (++seen == 20) at = n + 2;           /* well into the walk, not its first step */
+        }
+        /* SR_FI_SHOT=turn: the first in-between frame while the camera is turning */
+        if (at == 0 && sr_twinstick_setting(SR_TS_TURNING) != 0.0f && s_fi_phase == 2) at = n + 2;
+        if (at > 0 && ((s_fi_phase == 2 && (n == at - 1 || n == at)) || (s_fi_phase == 1 && n + 1 == at)))
+            sdl3vk_request_screenshot();
+        if (s_fi_phase == 1) n++;
+    }
+    int shown;
+    if (s_fi_phase == 1) {
+        shown = gegpu_present_interp(s_fi_img);
+        s_fi_phase = 2;
+    } else {
+        shown = gegpu_present(s_fi_fb, s_fi_fmt, s_fi_stride);
+        if (shown < 0) { convert_fb(s_fi_fb, s_fi_fmt, s_fi_stride); shown = sdl3vk_present_rgba(s_px); }
+        s_fi_phase = 0;
+    }
+    if (shown == 0) { sdl3vk_shutdown(); _Exit(0); }
+#endif
+}
+
+#ifdef SR_SDL3VK
+/* ---- in-game settings menu (Esc, or Back+Start on a controller) --------------------------
+ * The game is paused while it is open: this loop keeps re-presenting the last frame with the
+ * menu drawn over it and only returns when the menu closes. */
+static int s_input_block = 0;
+
+/* Controls page: every action with two keys and a controller button. Left/Right picks the
+ * column, Enter / A waits for the new key, mouse button or controller button, Delete / X(pad)
+ * clears, Esc goes back. */
+static void controls_run(uint32_t fbaddr, int fmt, uint32_t stride) {
+    enum { VIS = 10 };
+    const int nb = sdl3vk_bind_count(), no = sdl3vk_input_opt_count();
+    const int n = nb + no, rows = n + 2;               /* bindings, options, "Reset to defaults", "Back" */
+    int cur = 0, col = 0, top = 0;
+    for (;;) {
+        if (cur < top) top = cur;
+        if (cur >= top + VIS) top = cur - VIS + 1;
+        char buf[16][96]; const char *lines[16]; int k = 0, selline = 2;
+        const int cap = sdl3vk_bind_capturing();
+        snprintf(buf[k++], 96, "Controls");
+        snprintf(buf[k++], 96, "Action\tKey / mouse\tKey / mouse\tController");
+        for (int r = top; r < rows && r < top + VIS; r++) {
+            if (r == cur) selline = k;
+            if (r == n) { snprintf(buf[k++], 96, "Reset to defaults"); continue; }
+            if (r == n + 1) { snprintf(buf[k++], 96, "Back"); continue; }
+            if (r >= nb) { sdl3vk_input_opt_text(r - nb, buf[k++], 96); continue; }
+            char c[3][40];
+            for (int j = 0; j < 3; j++) {
+                char t[32]; sdl3vk_bind_text(r, j, t, sizeof(t));
+                if (r == cur && j == col) snprintf(c[j], 40, cap ? "[ press... ]" : "[ %s ]", t[0] ? t : "-");
+                else snprintf(c[j], 40, "%s", t[0] ? t : "-");
+            }
+            snprintf(buf[k++], 96, "%s\t%s\t%s\t%s", sdl3vk_bind_label(r), c[0], c[1], c[2]);
+        }
+        snprintf(buf[k++], 96, " ");
+        snprintf(buf[k++], 96, cap ? (col < 2 ? "Press the new key or mouse button   (Esc: cancel)"
+                                              : "Press the new controller button   (Guide: cancel)")
+                                   : "Enter / A: change     Delete / X: clear     Esc / B: back");
+        for (int i = 0; i < k; i++) lines[i] = buf[i];
+        sdl3vk_menu_show(lines, k, selline);
+        int shown = gegpu_present(fbaddr, fmt, stride);
+        if (shown < 0) shown = sdl3vk_present_rgba(s_px);
+        if (shown == 0) { sdl3vk_shutdown(); _Exit(0); }
+        const int ev = sdl3vk_menu_events();
+        if (!cap) {
+            if (ev & (SDL3VK_MENU_TOGGLE | SDL3VK_MENU_BACK)) break;
+            if (ev & SDL3VK_MENU_UP)    cur = cur > 0 ? cur - 1 : rows - 1;
+            if (ev & SDL3VK_MENU_DOWN)  cur = cur < rows - 1 ? cur + 1 : 0;
+            const int opt = cur >= nb && cur < n;
+            if (opt && (ev & (SDL3VK_MENU_LEFT | SDL3VK_MENU_RIGHT | SDL3VK_MENU_OK)))
+                sdl3vk_input_opt_change(cur - nb, (ev & SDL3VK_MENU_LEFT) ? -1 : 1);
+            else {
+                if (ev & SDL3VK_MENU_LEFT)  col = col > 0 ? col - 1 : 2;
+                if (ev & SDL3VK_MENU_RIGHT) col = col < 2 ? col + 1 : 0;
+                if (ev & SDL3VK_MENU_OK) {
+                    if (cur == n) sdl3vk_bind_reset();
+                    else if (cur == n + 1) break;
+                    else sdl3vk_bind_capture(cur, col);
+                }
+            }
+            if ((ev & SDL3VK_MENU_CLEAR) && cur < nb) sdl3vk_bind_clear(cur, col);
+        }
+        Sleep(15);
+    }
+    (void)sdl3vk_menu_events();
+}
+
+/* Cheats page (cheats.c): each cheat on/off, saved in cheats.cfg. */
+static void cheats_run(uint32_t fbaddr, int fmt, uint32_t stride) {
+    extern int sr_cheat_count(void); extern void sr_cheat_text(int, char *, int);
+    extern void sr_cheat_toggle(int); extern void sr_cheats_all_off(void);
+    const int n = sr_cheat_count(), rows = n + 2;      /* cheats, "All off", "Back" */
+    int cur = 0;
+    for (;;) {
+        char buf[16][96]; const char *lines[16]; int k = 0, selline = 1;
+        snprintf(buf[k++], 96, "Cheats");
+        for (int r = 0; r < rows; r++) {
+            if (r == cur) selline = k;
+            if (r < n) sr_cheat_text(r, buf[k++], 96);
+            else snprintf(buf[k++], 96, r == n ? "All off" : "Back");
+        }
+        snprintf(buf[k++], 96, " ");
+        snprintf(buf[k++], 96, "They stay on until you switch them off (cheats.cfg).");
+        snprintf(buf[k++], 96, "Enter / A: on / off     Esc / B: back");
+        for (int i = 0; i < k; i++) lines[i] = buf[i];
+        sdl3vk_menu_show(lines, k, selline);
+        int shown = gegpu_present(fbaddr, fmt, stride);
+        if (shown < 0) shown = sdl3vk_present_rgba(s_px);
+        if (shown == 0) { sdl3vk_shutdown(); _Exit(0); }
+        const int ev = sdl3vk_menu_events();
+        if (ev & (SDL3VK_MENU_TOGGLE | SDL3VK_MENU_BACK)) break;
+        if (ev & SDL3VK_MENU_UP)   cur = cur > 0 ? cur - 1 : rows - 1;
+        if (ev & SDL3VK_MENU_DOWN) cur = cur < rows - 1 ? cur + 1 : 0;
+        if (ev & (SDL3VK_MENU_OK | SDL3VK_MENU_LEFT | SDL3VK_MENU_RIGHT)) {
+            if (cur < n) sr_cheat_toggle(cur);
+            else if (cur == n) { if (ev & SDL3VK_MENU_OK) sr_cheats_all_off(); }
+            else if (ev & SDL3VK_MENU_OK) break;
+        }
+        Sleep(15);
+    }
+    (void)sdl3vk_menu_events();
+}
+
+static void menu_run(uint32_t fbaddr, int fmt, uint32_t stride) {
+    enum { M_RESUME = 1, M_CONTROLS, M_CHEATS, M_CAMSTYLE, M_FREEAIM, M_ANALOG, M_SPEED, M_INVX, M_INVY, M_RECENTER, M_RES, M_WIDE, M_FPS, M_SHOWFPS, M_GLOW, M_TEXFILT, M_UIFILT, M_UPSCALE, M_PROMPTS, M_INTRO, M_UPDATE, M_FULL, M_SHOT, M_QUIT, M_COUNT };
+    int sel = M_RESUME;
+    const int active_scale = sdl3vk_render_scale();
+    static int boot_cfg = -1;                      /* render_scale setting the game started with */
+    if (boot_cfg < 0) boot_cfg = sdl3vk_render_scale_cfg();
+    for (;;) {
+        char buf[M_COUNT + 1][96];
+        const char *lines[M_COUNT + 1];
+        const int cfg_scale = sdl3vk_render_scale_cfg();
+        {   extern const char *sr_version(void); extern const char *sr_update_available(void);
+            const char *up = sr_update_available();
+            if (up) snprintf(buf[0], 96, "Settings  (paused)   v%s  -  %s available", sr_version(), up);
+            else snprintf(buf[0], 96, "Settings  (game paused)   v%s", sr_version()); }
+        snprintf(buf[M_RESUME], 96, "Resume");
+        snprintf(buf[M_CONTROLS], 96, "Controls...");
+        snprintf(buf[M_CHEATS], 96, "Cheats...");
+        {   static const char *const cs[3] = { "Classic (orbit, returns behind Aya)", "Modern (over the shoulder, free look)",
+                                               "Centred (Aya in the middle, free look)" };
+            snprintf(buf[M_CAMSTYLE], 96, "Camera style:  %s", cs[(int)sr_twinstick_setting(SR_TS_STYLE) % 3]); }
+        snprintf(buf[M_FREEAIM], 96, "Free aim (mouse / right stick while aiming):  %s", sr_twinstick_setting(SR_TS_FREE_AIM) != 0.0f ? "On" : "Off");
+        snprintf(buf[M_ANALOG], 96, "Left stick:  %s", sr_twinstick_setting(SR_TS_ANALOG_MOVE) != 0.0f ? "Full analog (runs where you point)" : "Original (runs straight within ~35 deg)");
+        snprintf(buf[M_SPEED], 96, "Camera speed:  %.2f", sr_twinstick_setting(SR_TS_SENSITIVITY));
+        snprintf(buf[M_INVX], 96, "Invert camera left/right:  %s", sr_twinstick_setting(SR_TS_INVERT_X) != 0.0f ? "On" : "Off");
+        snprintf(buf[M_INVY], 96, "Invert camera up/down:  %s", sr_twinstick_setting(SR_TS_INVERT_Y) != 0.0f ? "On" : "Off");
+        snprintf(buf[M_RECENTER], 96, "Camera returns behind Aya:  %s", sr_twinstick_setting(SR_TS_RECENTER) != 0.0f ? "On" : "Off");
+        const char *restart = cfg_scale != boot_cfg ? "  (restart to apply)" : "";
+        if (cfg_scale <= 0)
+            snprintf(buf[M_RES], 96, "Resolution:  Auto  (now %dx)%s", active_scale, restart);
+        else
+            snprintf(buf[M_RES], 96, "Resolution:  %dx  (%dx%d)%s", cfg_scale, 480 * cfg_scale, 272 * cfg_scale, restart);
+        snprintf(buf[M_WIDE], 96, "Aspect ratio:  %s", sdl3vk_cfg_get("widescreen", 0) ? "Fill the window (wider view)" : "Original");
+        snprintf(buf[M_FPS], 96, "Frame rate:  %s", gegpu_interp_enabled() ? "60 (smooth)" : "30 (original)");
+        snprintf(buf[M_INTRO], 96, "Skip intro at start:  %s", sdl3vk_cfg_get("skip_intro", 0) ? "On" : "Off");
+        snprintf(buf[M_GLOW], 96, "Glow effect (bloom):  %s", sdl3vk_glow() ? "On (original)" : "Off");
+        {   static const char *const fn[3] = { "As the game sets it", "Sharp (nearest)", "Smooth (bilinear)" };
+            snprintf(buf[M_TEXFILT], 96, "Texture filtering (3D):  %s", fn[sdl3vk_cfg_get("tex_filter", 0) % 3]);
+            snprintf(buf[M_UIFILT], 96, "Texture filtering (HUD / menus):  %s", fn[sdl3vk_cfg_get("ui_filter", 0) % 3]);
+            const int up = sdl3vk_cfg_get("tex_upscale", 1);
+            if (up >= 2 && up <= 4) snprintf(buf[M_UPSCALE], 96, "Texture upscaling:  %dx (xBRZ)", up);
+            else snprintf(buf[M_UPSCALE], 96, "Texture upscaling:  Off"); }
+        snprintf(buf[M_PROMPTS], 96, "Button prompts:  %s", sdl3vk_cfg_get("button_prompts", 0) ? "Xbox" : "PSP (original)");
+        snprintf(buf[M_SHOWFPS], 96, "Show FPS counter:  %s", sdl3vk_show_fps() ? "On" : "Off");
+        snprintf(buf[M_UPDATE], 96, "Check for updates at start:  %s", sdl3vk_cfg_get("update_check", 1) ? "On" : "Off");
+        snprintf(buf[M_FULL], 96, "Fullscreen:  %s", sdl3vk_fullscreen() ? "On" : "Off");
+        snprintf(buf[M_SHOT], 96, "Save screenshot  (F12)");
+        snprintf(buf[M_QUIT], 96, "Quit game");
+        for (int i = 0; i < M_COUNT; i++) lines[i] = buf[i];
+        snprintf(buf[M_COUNT], 96, "Esc / B: back     Enter / A: select     Left / Right: change");
+        lines[M_COUNT] = buf[M_COUNT];
+        sdl3vk_menu_show(lines, M_COUNT + 1, sel);
+
+        int shown = gegpu_present(fbaddr, fmt, stride);
+        if (shown < 0) shown = sdl3vk_present_rgba(s_px);
+        if (shown == 0) { sdl3vk_shutdown(); _Exit(0); }
+
+        const int ev = sdl3vk_menu_events();
+        if (ev && getenv("SR_MENULOG")) fprintf(stderr, "menu: events 0x%x sel %d\n", ev, sel);
+        if (ev & (SDL3VK_MENU_TOGGLE | SDL3VK_MENU_BACK)) break;
+        if (ev & SDL3VK_MENU_UP)   sel = sel > M_RESUME ? sel - 1 : M_COUNT - 1;
+        if (ev & SDL3VK_MENU_DOWN) sel = sel < M_COUNT - 1 ? sel + 1 : M_RESUME;
+        const int dir = (ev & SDL3VK_MENU_RIGHT) ? 1 : (ev & SDL3VK_MENU_LEFT) ? -1 : (ev & SDL3VK_MENU_OK) ? 1 : 0;
+        if (dir) {
+            switch (sel) {
+            case M_RESUME: if (ev & SDL3VK_MENU_OK) goto done; break;
+            case M_CONTROLS: if (ev & SDL3VK_MENU_OK) controls_run(fbaddr, fmt, stride); break;
+            case M_CHEATS: if (ev & SDL3VK_MENU_OK) cheats_run(fbaddr, fmt, stride); break;
+            case M_CAMSTYLE: sr_twinstick_set(SR_TS_STYLE, (float)(((int)sr_twinstick_setting(SR_TS_STYLE) + (dir > 0 ? 1 : 2)) % 3)); break;
+            case M_FREEAIM: sr_twinstick_set(SR_TS_FREE_AIM, sr_twinstick_setting(SR_TS_FREE_AIM) == 0.0f); break;
+            case M_ANALOG: sr_twinstick_set(SR_TS_ANALOG_MOVE, sr_twinstick_setting(SR_TS_ANALOG_MOVE) == 0.0f); break;
+            case M_SPEED:
+                sr_twinstick_set(SR_TS_SENSITIVITY, sr_twinstick_setting(SR_TS_SENSITIVITY) * (dir > 0 ? 1.15f : 1.0f / 1.15f));
+                break;
+            case M_INVX: sr_twinstick_set(SR_TS_INVERT_X, sr_twinstick_setting(SR_TS_INVERT_X) == 0.0f); break;
+            case M_INVY: sr_twinstick_set(SR_TS_INVERT_Y, sr_twinstick_setting(SR_TS_INVERT_Y) == 0.0f); break;
+            case M_RECENTER: sr_twinstick_set(SR_TS_RECENTER, sr_twinstick_setting(SR_TS_RECENTER) == 0.0f); break;
+            case M_RES: {
+                int v = cfg_scale + dir;
+                if (v < 0) v = 6;
+                if (v > 6) v = 0;
+                sdl3vk_set_render_scale_cfg(v);
+                break;
+            }
+            case M_GLOW: sdl3vk_set_glow(!sdl3vk_glow()); break;
+            case M_UPSCALE: {   /* Off, 2x, 3x, 4x */
+                extern void gegpu_set_upscale(int f);
+                int up = sdl3vk_cfg_get("tex_upscale", 1);
+                if (up < 2 || up > 4) up = 1;
+                up = dir > 0 ? (up >= 4 ? 1 : up + 1) : (up <= 1 ? 4 : up - 1);
+                sdl3vk_cfg_set("tex_upscale", up); gegpu_set_upscale(up);
+                break;
+            }
+            case M_PROMPTS: {
+                extern void gegpu_set_prompts(int v);
+                const int v = !sdl3vk_cfg_get("button_prompts", 0);
+                sdl3vk_cfg_set("button_prompts", v); gegpu_set_prompts(v);
+                break;
+            }
+            case M_TEXFILT: case M_UIFILT: {
+                extern void gegpu_set_filter(int ui, int v);
+                const char *k = sel == M_UIFILT ? "ui_filter" : "tex_filter";
+                const int v = (sdl3vk_cfg_get(k, 0) + (dir > 0 ? 1 : 2)) % 3;
+                sdl3vk_cfg_set(k, v); gegpu_set_filter(sel == M_UIFILT, v);
+                break;
+            }
+            case M_SHOWFPS: sdl3vk_set_show_fps(!sdl3vk_show_fps()); break;
+            case M_UPDATE: sdl3vk_cfg_set("update_check", !sdl3vk_cfg_get("update_check", 1)); break;
+            case M_WIDE: sdl3vk_set_widescreen(!sdl3vk_cfg_get("widescreen", 0)); break;
+            case M_INTRO: sdl3vk_cfg_set("skip_intro", !sdl3vk_cfg_get("skip_intro", 0)); break;
+            case M_FPS: {
+                const int on = !gegpu_interp_enabled();
+                gegpu_interp_set(on);
+                sdl3vk_cfg_set("frame_interpolation", on);
+                break;
+            }
+            case M_FULL: sdl3vk_set_fullscreen(!sdl3vk_fullscreen()); break;
+            case M_SHOT: if (ev & SDL3VK_MENU_OK) sdl3vk_request_screenshot(); break;
+            case M_QUIT: if (ev & SDL3VK_MENU_OK) { sdl3vk_shutdown(); _Exit(0); } break;
+            default: break;
+            }
+        }
+        Sleep(15);
+    }
+done:
+    sdl3vk_menu_show(NULL, 0, 0);
+    s_input_block = 1;
+}
+#endif
+
+static uint32_t s_last_fb, s_last_stride = 512; static int s_last_fmt = 3, s_last_ok = 0;
+
+#ifdef SR_SDL3VK
+/* Modal list dialog over the last game frame (the PSP system save/load screens). Items are
+ * single lines; details[i] (may hold '
+') is shown under the list for the selected item.
+ * Returns 1 = chosen (*sel), 0 = backed out, -1 = no window (headless: caller decides). */
+#ifdef __ANDROID__
+typedef struct {
+    const char *title; const char *const *items; int n; const char *const *details; int *sel; const char *help;
+    int ret;
+} GuiDialogArgs;
+static int gui_dialog_impl(const char *title, const char *const *items, int n, const char *const *details, int *sel, const char *help);
+static void gui_dialog_tramp(void *p) {
+    GuiDialogArgs *a = (GuiDialogArgs *)p;
+    a->ret = gui_dialog_impl(a->title, a->items, a->n, a->details, a->sel, a->help);
+}
+int gui_dialog(const char *title, const char *const *items, int n, const char *const *details,
+               int *sel, const char *help) {
+    extern void sched_run_on_main_stack(void (*fn)(void *), void *arg);
+    GuiDialogArgs a = { title, items, n, details, sel, help, -1 };
+    sched_run_on_main_stack(gui_dialog_tramp, &a);
+    return a.ret;
+}
+static int gui_dialog_impl(const char *title, const char *const *items, int n, const char *const *details,
+                           int *sel, const char *help) {
+#else
+int gui_dialog(const char *title, const char *const *items, int n, const char *const *details,
+               int *sel, const char *help) {
+#endif
+    if (!s_on || !s_sdl3 || !s_last_ok || n <= 0) return -1;
+    enum { VIS = 7 };
+    int cur = *sel < 0 || *sel >= n ? 0 : *sel, top = 0;
+    (void)sdl3vk_menu_events();                    /* drop presses made before the dialog */
+    { extern uint32_t ctrlsrv_take_presses(void); (void)ctrlsrv_take_presses(); }
+#ifdef __ANDROID__
+    extern int  sdl3vk_android_dialog_open(const char *title, const char *const *items, int n,
+                                           const char *const *details, int sel, const char *help);
+    extern int  sdl3vk_android_dialog_poll(int *out_res, int *out_sel);
+    extern void sdl3vk_android_dialog_set_sel(int sel);
+    extern void sdl3vk_android_dialog_close(void);
+    const int and_dlg = sdl3vk_android_dialog_open(title, items, n, details, cur, help);
+#endif
+    int result = 0;
+    for (;;) {
+#ifdef __ANDROID__
+        if (and_dlg && sdl3vk_android_dialog_poll(&result, &cur)) break;
+#endif
+        if (cur < top) top = cur;
+        if (cur >= top + VIS) top = cur - VIS + 1;
+        char buf[16][96]; const char *lines[16]; int k = 0, selline = 1;
+        snprintf(buf[k], 96, "%s", title); k++;
+        for (int i = top; i < n && i < top + VIS; i++) {
+            if (i == cur) selline = k;
+            snprintf(buf[k], 96, "%s%s", items[i], (i == top + VIS - 1 && i < n - 1) ? "   ..." : ""); k++;
+        }
+        snprintf(buf[k], 96, " "); k++;
+        if (details && details[cur]) {
+            const char *d = details[cur];
+            while (*d && k < 15) {
+                const char *e = strchr(d, '\n'); int len = e ? (int)(e - d) : (int)strlen(d);
+                if (len > 90) len = 90;
+                snprintf(buf[k], 96, "   %.*s", len, d); k++;
+                if (!e) break;
+                d = e + 1;
+            }
+        }
+        if (k < 16) { snprintf(buf[k], 96, "%s", help ? help : "X / Enter: select     Z / Backspace: back"); k++; }
+        for (int i = 0; i < k; i++) lines[i] = buf[i];
+        sdl3vk_menu_show(lines, k, selline);
+        int shown = gegpu_present(s_last_fb, s_last_fmt, s_last_stride);
+        if (shown < 0) shown = sdl3vk_present_rgba(s_px);
+        if (shown == 0) { sdl3vk_shutdown(); _Exit(0); }
+        int ev = sdl3vk_menu_events();
+        {   /* the test control channel (ctrl_server.c) presses PSP buttons */
+            extern uint32_t ctrlsrv_take_presses(void);
+            const uint32_t b = ctrlsrv_take_presses();
+            if (b & 0x0010u) ev |= SDL3VK_MENU_UP;
+            if (b & 0x0040u) ev |= SDL3VK_MENU_DOWN;
+            if (b & 0x4000u) ev |= SDL3VK_MENU_OK;
+            if (b & 0x2000u) ev |= SDL3VK_MENU_BACK;
+        }
+        if (ev & SDL3VK_MENU_UP)   { cur = cur > 0 ? cur - 1 : n - 1;
+#ifdef __ANDROID__
+            if (and_dlg) sdl3vk_android_dialog_set_sel(cur);
+#endif
+        }
+        if (ev & SDL3VK_MENU_DOWN) { cur = cur < n - 1 ? cur + 1 : 0;
+#ifdef __ANDROID__
+            if (and_dlg) sdl3vk_android_dialog_set_sel(cur);
+#endif
+        }
+        if (ev & SDL3VK_MENU_OK)   { result = 1; break; }
+        if (ev & (SDL3VK_MENU_BACK | SDL3VK_MENU_TOGGLE)) { result = 0; break; }
+        Sleep(15);
+    }
+#ifdef __ANDROID__
+    if (and_dlg) sdl3vk_android_dialog_close();
+#endif
+    sdl3vk_menu_show(NULL, 0, 0);
+    s_input_block = 1;                             /* the confirming press must not reach the game */
+    *sel = cur;
+    return result;
+}
+#else
+#ifdef __ANDROID__
+typedef struct {
+    const char *title; const char *const *items; int n; const char *const *details; int *sel; const char *help;
+    int ret;
+} GuiDialogArgs;
+static int gui_dialog_impl(const char *title, const char *const *items, int n, const char *const *details, int *sel, const char *help);
+static void gui_dialog_tramp(void *p) {
+    GuiDialogArgs *a = (GuiDialogArgs *)p;
+    a->ret = gui_dialog_impl(a->title, a->items, a->n, a->details, a->sel, a->help);
+}
+int gui_dialog(const char *title, const char *const *items, int n, const char *const *details,
+               int *sel, const char *help) {
+    extern void sched_run_on_main_stack(void (*fn)(void *), void *arg);
+    GuiDialogArgs a = { title, items, n, details, sel, help, -1 };
+    sched_run_on_main_stack(gui_dialog_tramp, &a);
+    return a.ret;
+}
+static int gui_dialog_impl(const char *title, const char *const *items, int n, const char *const *details,
+                           int *sel, const char *help) {
+#else
+int gui_dialog(const char *title, const char *const *items, int n, const char *const *details,
+               int *sel, const char *help) {
+#endif (void)title; (void)items; (void)n; (void)details; (void)sel; (void)help; return -1; }
+#endif
+
+#ifdef __ANDROID__
+typedef struct { uint32_t fbaddr; int fmt; uint32_t stride; } GuiPresentArgs;
+static void gui_present_impl(uint32_t fbaddr, int fmt, uint32_t stride);
+static void gui_present_tramp(void *p) {
+    GuiPresentArgs *a = (GuiPresentArgs *)p;
+    gui_present_impl(a->fbaddr, a->fmt, a->stride);
+}
+void gui_present(uint32_t fbaddr, int fmt, uint32_t stride) {
+    extern void sched_run_on_main_stack(void (*fn)(void *), void *arg);
+    GuiPresentArgs a = { fbaddr, fmt, stride };
+    sched_run_on_main_stack(gui_present_tramp, &a);
+}
+static void gui_present_impl(uint32_t fbaddr, int fmt, uint32_t stride) {
+#else
+void gui_present(uint32_t fbaddr, int fmt, uint32_t stride) {
+#endif
+    if (!s_on) return;
+    if (stride == 0) stride = 512;
+    s_last_fb = fbaddr; s_last_fmt = fmt; s_last_stride = stride; s_last_ok = 1;
+    { extern volatile int g_drawlog_on; if (g_drawlog_on) g_drawlog_on--; }   /* 2: start at this frame, 1: log, 0: done */
+
+#ifdef SR_SDL3VK
+    { extern float g_ge_ws; if (s_sdl3) g_ge_ws = sdl3vk_widescreen_factor(); }   /* next frame's squeeze */
+    if (s_sdl3) sdl3vk_fps_game_frame();
+    { extern uint32_t g_ge_skip_glow, g_ge_glow_buf; g_ge_skip_glow = (s_sdl3 && !sdl3vk_glow()) ? ADDR_GLOW_BUFFER : 0;
+      g_ge_glow_buf = ADDR_GLOW_BUFFER; }
+    if (s_sdl3) {
+        /* GPU-resident framebuffer: blit straight from the GE's target image. Falls back
+         * to the guest-VRAM convert for CPU-written frames (movies) or pure software GE.
+         * With frame interpolation, a game frame finished every second vblank (the game's
+         * 30 fps) is not shown now: the next vblank shows a frame halfway between it and the
+         * previous one, the vblank after that shows the frame itself (gui_vblank). */
+        int shown = 1;
+        void *mid = NULL;
+        extern int sched_fast_forward(void);
+        if (sched_fast_forward()) {           /* intro skip: show every 4th frame, no waiting */
+            static unsigned ffn = 0;
+            s_fi_phase = 0;
+            if ((ffn++ & 3) != 0) return;
+            shown = gegpu_present(fbaddr, fmt, stride);
+            if (shown < 0) { convert_fb(fbaddr, fmt, stride); shown = sdl3vk_present_rgba(s_px); }
+            if (shown == 0) { sdl3vk_shutdown(); _Exit(0); }
+            s_buttons = sdl3vk_buttons();
+            sdl3vk_analog(&s_lx, &s_ly);
+            sdl3vk_rstick(&s_rx, &s_ry);
+            return;
+        }
+        { extern int g_ge_interp_on; g_ge_interp_on = gegpu_interp_enabled(); }
+        if (gegpu_interp_enabled()) {
+            extern uint64_t sched_vblank_count(void);
+            static uint64_t last_flip = 0;
+            const uint64_t vb = sched_vblank_count();
+            if (s_fi_phase) fi_show_held();              /* still holding the previous frame */
+            /* A PC that can't keep up with 60 fps here (vblanks keep arriving late) would slow
+             * the whole game down, sound included: show the game's own 30 fps for a while, then
+             * try 60 again (waiting longer each time it fails, up to a minute). */
+            static int drop = 0; static double retry_at = 0.0, hold = 4.0, calm_since = 0.0;
+            {
+                extern float sched_late_fraction(void);
+                LARGE_INTEGER c; QueryPerformanceCounter(&c);
+                const double now_s = (double)c.QuadPart / (double)s_freq.QuadPart;
+                static int adapt = -1;                     /* SR_INTERP_ADAPT=0: never drop (tests) */
+                if (adapt < 0) { const char *e = getenv("SR_INTERP_ADAPT"); adapt = !(e && e[0] == '0'); }
+                const float late = adapt ? sched_late_fraction() : 0.0f;
+                if (!drop && late > 0.3f) {
+                    drop = 1; retry_at = now_s + hold;
+                    fprintf(stderr, "interp: falling behind (%.0f%% of vblanks late), 30 fps for %.0f s\n", late * 100.0f, hold);
+                    if (hold < 60.0) hold *= 2.0;
+                } else if (drop && now_s >= retry_at && late < 0.05f) {
+                    drop = 0;
+                    fprintf(stderr, "interp: trying 60 fps again\n");
+                }
+                if (drop || late >= 0.02f) calm_since = 0.0;   /* 60 fps holding a minute: forget old failures */
+                else if (calm_since == 0.0) calm_since = now_s;
+                else if (now_s - calm_since > 60.0) hold = 4.0;
+            }
+            mid = gegpu_interp_frame(fbaddr, fmt, !drop && vb - last_flip == 2 ? 0.5f : -1.0f);
+            { extern void ge_interp_frame(void); ge_interp_frame(); }   /* skinned-draw tables */
+            last_flip = vb;
+        }
+        if (mid) {
+            s_fi_img = mid; s_fi_fb = fbaddr; s_fi_fmt = fmt; s_fi_stride = stride; s_fi_phase = 1;
+        } else {
+            shown = gegpu_present(fbaddr, fmt, stride);
+            if (shown < 0) {
+                convert_fb(fbaddr, fmt, stride);
+                shown = sdl3vk_present_rgba(s_px);
+            }
+        }
+        if (shown == 0) { sdl3vk_shutdown(); _Exit(0); }
+        /* SR_PACELOG=1: every 5 s, how evenly frames were presented (stutter hunting) */
+        {
+            static int on = -1;
+            if (on < 0) on = getenv("SR_PACELOG") ? 1 : 0;
+            if (on) {
+                static LARGE_INTEGER prev, t0;
+                static unsigned n, slow, vslow; static double maxgap;
+                LARGE_INTEGER now; QueryPerformanceCounter(&now);
+                if (prev.QuadPart) {
+                    double g = (double)(now.QuadPart - prev.QuadPart) * 1000.0 / (double)s_freq.QuadPart;
+                    n++; if (g > 40.0) slow++; if (g > 70.0) vslow++; if (g > maxgap) maxgap = g;
+                } else t0 = now;
+                prev = now;
+                if ((double)(now.QuadPart - t0.QuadPart) / (double)s_freq.QuadPart >= 5.0) {
+                    extern uint64_t sched_vblank_count(void); extern float sched_late_fraction(void);
+                    static uint64_t vb0 = 0; const uint64_t vbn = sched_vblank_count();
+                    fprintf(stderr, "PACE 5s: presents %u, gaps >40ms %u, >70ms %u, max %.0f ms, vblanks %llu (300 = full speed), late %.0f%%\n",
+                            n, slow, vslow, maxgap, (unsigned long long)(vbn - vb0), sched_late_fraction() * 100.0f);
+                    vb0 = vbn;
+                    n = slow = vslow = 0; maxgap = 0; t0 = now;
+                }
+            }
+        }
+        if (sdl3vk_menu_events() & SDL3VK_MENU_TOGGLE) { s_fi_phase = 0; menu_run(fbaddr, fmt, stride); }
+        s_buttons = sdl3vk_buttons();
+        sdl3vk_analog(&s_lx, &s_ly);
+        sdl3vk_rstick(&s_rx, &s_ry);
+        s_pad_present = sdl3vk_pad_present();
+        if (s_input_block) {          /* after the menu: ignore input until everything is released */
+            if (s_buttons == 0 && s_lx > 88 && s_lx < 168 && s_ly > 88 && s_ly < 168) s_input_block = 0;
+            else { s_buttons = 0; s_lx = s_ly = 128; s_rx = s_ry = 0.0f; }
+        }
+        goto pace;
+    }
+#endif
+
+#ifdef _WIN32
+    MSG msg;
+    while (PeekMessageA(&msg, 0, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) { _Exit(0); }
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+    uint8_t lx = 128, ly = 128;
+    s_buttons = read_keys() | read_pad(&lx, &ly);
+    s_lx = lx; s_ly = ly;
+
+    convert_fb(fbaddr, fmt, stride);
+    HDC dc = GetDC(s_hwnd);
+    RECT cr; GetClientRect(s_hwnd, &cr);
+    StretchDIBits(dc, 0, 0, cr.right, cr.bottom, 0, 0, PSP_W, PSP_H,
+                  s_px, &s_bmi, DIB_RGB_COLORS, SRCCOPY);
+    ReleaseDC(s_hwnd, dc);
+#endif
+
+#ifdef SR_SDL3VK
+pace:
+#endif
+    /* Pace to ~60 Hz so the intro/menus play at a watchable speed. Skipped when the scheduler
+     * already paces vblanks to real time (the default): pacing twice on unaligned grids makes
+     * frames miss their vblank and costs a whole extra period (30/20 fps quantization). */
+    {
+        extern int sched_vbl_paced(void);
+        if (sched_vbl_paced()) { QueryPerformanceCounter(&s_last); return; }
+    }
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    double dt = (double)(now.QuadPart - s_last.QuadPart) / (double)s_freq.QuadPart;
+    double target = 1.0 / 60.0;
+    if (dt < target) {
+        DWORD ms = (DWORD)((target - dt) * 1000.0);
+        if (ms > 0 && ms < 100) Sleep(ms);
+    }
+    QueryPerformanceCounter(&s_last);
+}

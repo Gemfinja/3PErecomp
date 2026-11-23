@@ -1,0 +1,34 @@
+﻿covered 255/273 imports (306 handlers registered in runtime)
+
+   sceHttp                  3/20  sceHttpGetContentLength, sceHttpSetResolveRetry, sceHttpSetRecvTimeOut, sceHttpAddExtraHeader, sceHttpSetResolveTimeOut, sceHttpGetStatusCode, sceHttpDeleteConnection, sceHttpSetConnectTimeOut, sceHttpSetSendTimeOut, sceHttpCreateTemplate, sceHttpDeleteRequest, sceHttpCreateRequestWithURL, sceHttpSendRequest, sceHttpCreateConnectionWithURL, sceHttpGetAllHeader, sceHttpReadData, sceHttpDeleteTemplate
+   sceParseHttp             0/1   sceParseHttpResponseHeader
+ok InterruptManager         3/3   
+ok IoFileMgrForUser        24/24  
+ok Kernel_Library           7/7   
+ok LoadExecForUser          2/2   
+ok ModuleMgrForUser         7/7   
+ok StdioForUser             3/3   
+ok SysMemUserForUser        6/6   
+ok ThreadManForUser        37/37  
+ok UtilsForUser             8/8   
+ok sceAtrac3plus           13/13  
+ok sceAudio                14/14  
+ok sceCtrl                  2/2   
+ok sceDisplay               6/6   
+ok sceDmac                  1/1   
+ok sceGe_user              11/11  
+ok sceImpose                1/1   
+ok sceMpeg                 25/25  
+ok sceNet                   2/2   
+ok sceNetAdhocctl           4/4   
+ok sceNetApctl              6/6   
+ok sceNetInet               2/2   
+ok sceNetResolver           2/2   
+ok sceOpenPSID              1/1   
+ok scePower                 5/5   
+ok sceRtc                   3/3   
+ok sceSasCore              27/27  
+ok sceSuspendForUser        6/6   
+ok sceUmdUser               8/8   
+ok sceUtility              15/15  
+ok sceWlanDrv               1/1   
